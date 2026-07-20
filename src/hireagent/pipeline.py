@@ -62,7 +62,7 @@ _UPSTREAM: dict[str, str | None] = {
 # Individual stage runners
 # ---------------------------------------------------------------------------
 
-def _run_discover(workers: int = 1) -> dict:
+def _run_discover(workers: int = 1, limit: int = 0, hours_old: int = 0) -> dict:
     """Stage: Job discovery — JobSpy, Workday, ScoutBetter, and smart-extract scrapers."""
     stats: dict = {"jobspy": None, "workday": None, "scoutbetter": None, "smartextract": None}
     skip_smart_extract = os.environ.get("HIREAGENT_SKIP_SMART_EXTRACT", "").strip().lower() in {
@@ -76,7 +76,7 @@ def _run_discover(workers: int = 1) -> dict:
     console.print("  [cyan]JobSpy full crawl...[/cyan]")
     try:
         from hireagent.discovery.jobspy import run_discovery
-        run_discovery()
+        run_discovery(limit=limit, hours_old=hours_old)
         stats["jobspy"] = "ok"
     except Exception as e:
         log.error("JobSpy crawl failed: %s", e)
@@ -179,7 +179,7 @@ def _run_discover(workers: int = 1) -> dict:
     return stats
 
 
-def _run_enrich(workers: int = 1) -> dict:
+def _run_enrich(workers: int = 4) -> dict:
     """Stage: Detail enrichment — scrape full descriptions and apply URLs."""
     try:
         from hireagent.enrichment.detail import run_enrichment
@@ -328,6 +328,7 @@ _PENDING_SQL: dict[str, str] = {
         "SELECT COUNT(*) FROM jobs WHERE full_description IS NOT NULL "
         "AND title IS NOT NULL AND TRIM(title) != '' "
         "AND tailored_resume_path IS NULL "
+        "AND COALESCE(fit_score, 0) >= 5 "
         "AND COALESCE(tailor_attempts, 0) < 5"
     ),
     "cover": (
@@ -370,6 +371,8 @@ def _run_stage_streaming(
     stop_event: threading.Event,
     min_score: int = 7,
     workers: int = 1,
+    limit_discovery: int = 0,
+    hours_old: int = 0,
     validation_mode: str = "normal",
 ) -> None:
     """Run a single stage in streaming mode: loop until upstream done + no work.
@@ -385,6 +388,9 @@ def _run_stage_streaming(
         kwargs["validation_mode"] = validation_mode
     if stage in ("discover", "enrich"):
         kwargs["workers"] = workers
+    if stage == "discover":
+        kwargs["limit"] = limit_discovery
+        kwargs["hours_old"] = hours_old
     if stage == "apply":
         kwargs["min_score"] = min_score
 
@@ -435,6 +441,8 @@ def _run_stage_streaming(
 # ---------------------------------------------------------------------------
 
 def _run_sequential(ordered: list[str], min_score: int, workers: int = 1,
+                    limit_discovery: int = 0,
+                    hours_old: int = 0,
                     validation_mode: str = "normal") -> dict:
     """Execute stages one at a time (original behavior)."""
     results: list[dict] = []
@@ -484,6 +492,13 @@ def _run_sequential(ordered: list[str], min_score: int, workers: int = 1,
         if status not in ("ok", "partial"):
             errors[name] = status
 
+        # Flush WAL to main DB after each stage so reads in the next stage see
+        # committed data immediately (avoids 10s stale WAL reads under heavy load)
+        try:
+            get_connection().execute("PRAGMA wal_checkpoint(PASSIVE)")
+        except Exception:
+            pass
+
         console.print(f"\n  Stage '{name}' completed in {elapsed:.1f}s — {status}")
 
     total_elapsed = time.time() - pipeline_start
@@ -491,6 +506,8 @@ def _run_sequential(ordered: list[str], min_score: int, workers: int = 1,
 
 
 def _run_streaming(ordered: list[str], min_score: int, workers: int = 1,
+                   limit_discovery: int = 0,
+                   hours_old: int = 0,
                    validation_mode: str = "normal") -> dict:
     """Execute stages concurrently with DB as conveyor belt."""
     tracker = _StageTracker()
@@ -513,7 +530,7 @@ def _run_streaming(ordered: list[str], min_score: int, workers: int = 1,
         start_times[name] = time.time()
         t = threading.Thread(
             target=_run_stage_streaming,
-            args=(name, tracker, stop_event, min_score, workers, validation_mode),
+            args=(name, tracker, stop_event, min_score, workers, limit_discovery, hours_old, validation_mode),
             name=f"stage-{name}",
             daemon=True,
         )
@@ -560,6 +577,8 @@ def run_pipeline(
     dry_run: bool = False,
     stream: bool = False,
     workers: int = 1,
+    limit_discovery: int = 0,
+    hours_old: int = 0,
     validation_mode: str = "normal",
 ) -> dict:
     """Run pipeline stages.
@@ -611,9 +630,13 @@ def run_pipeline(
     # Execute
     if stream:
         result = _run_streaming(ordered, min_score, workers=workers,
+                                limit_discovery=limit_discovery,
+                                hours_old=hours_old,
                                 validation_mode=validation_mode)
     else:
         result = _run_sequential(ordered, min_score, workers=workers,
+                                 limit_discovery=limit_discovery,
+                                 hours_old=hours_old,
                                  validation_mode=validation_mode)
 
     # Summary table

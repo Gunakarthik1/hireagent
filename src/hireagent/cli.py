@@ -31,7 +31,7 @@ console = Console()
 log = logging.getLogger(__name__)
 
 # Valid pipeline stages (in execution order)
-VALID_STAGES = ("discover", "enrich", "score", "tailor", "cover", "pdf", "apply")
+VALID_STAGES = ("discover", "enrich", "score", "tailor", "cover", "pdf", "version", "apply")
 
 
 # ---------------------------------------------------------------------------
@@ -183,6 +183,8 @@ def run(
             "lenient: banned words ignored, LLM judge skipped (fastest, fewest API calls)."
         ),
     ),
+    limit_discovery: int = typer.Option(0, "--limit-discovery", help="Max new jobs to discover in the discover stage."),
+    hours_old: int = typer.Option(0, "--hours-old", help="Only scrape jobs posted within the last X hours."),
 ) -> None:
     """Run pipeline stages: discover, enrich, score, tailor, cover, pdf, apply. Use 'all' to run everything including apply."""
     _bootstrap()
@@ -224,6 +226,8 @@ def run(
         dry_run=dry_run,
         stream=stream,
         workers=workers,
+        limit_discovery=limit_discovery,
+        hours_old=hours_old,
         validation_mode=validation,
     )
 
@@ -235,7 +239,7 @@ def run(
 def apply(
     limit: Optional[int] = typer.Option(None, "--limit", "-l", help="Max applications to submit."),
     workers: int = typer.Option(1, "--workers", "-w", help="Number of parallel browser workers."),
-    min_score: int = typer.Option(7, "--min-score", help="Minimum fit score for job selection."),
+    min_score: int = typer.Option(5, "--min-score", help="Minimum fit score for job selection."),
     continuous: bool = typer.Option(False, "--continuous", "-c", help="Run forever, polling for new jobs."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Preview actions without submitting."),
     headless: bool = typer.Option(False, "--headless", help="Run browsers in headless mode."),
@@ -247,6 +251,7 @@ def apply(
     reset_failed: bool = typer.Option(False, "--reset-failed", help="Reset all failed jobs for retry."),
     greenhouse_only: bool = typer.Option(False, "--greenhouse-only", help="Only apply to Greenhouse ATS jobs (greenhouse.io)."),
     no_stealth: bool = typer.Option(False, "--no-stealth", help="Skip stealth gaps between jobs (fast mode for testing)."),
+    model: str = typer.Option("claude-sonnet-4-6", "--model", help="Claude model to use for --gen prompt (e.g. claude-sonnet-4-6)."),
 ) -> None:
     """Launch auto-apply to submit job applications."""
     _bootstrap()
@@ -413,13 +418,144 @@ def status() -> None:
 
 
 @app.command()
-def dashboard() -> None:
-    """Generate and open the HTML dashboard in your browser."""
+def dashboard(
+    host: str = typer.Option("127.0.0.1", "--host", help="Host to bind."),
+    port: int = typer.Option(8000, "--port", "-p", help="Port to listen on."),
+    no_browser: bool = typer.Option(False, "--no-browser", help="Don't auto-open browser."),
+    static: bool = typer.Option(False, "--static", help="Generate static HTML report instead of starting server."),
+) -> None:
+    """Launch the HireAgent dashboard (React + FastAPI)."""
     _bootstrap()
 
-    from hireagent.view import open_dashboard
+    if static:
+        from hireagent.view import open_dashboard
+        open_dashboard()
+        return
 
-    open_dashboard()
+    try:
+        import uvicorn
+    except ImportError:
+        console.print("[red]uvicorn not installed.[/red] Run: [bold]pip install uvicorn[/bold]")
+        raise typer.Exit(code=1)
+
+    import threading
+    import webbrowser
+    import time
+
+    url = f"http://{host}:{port}"
+    console.print(f"\n[bold]HireAgent Dashboard[/bold]")
+    console.print(f"  API:       [cyan]{url}/api/stats[/cyan]")
+    console.print(f"  Dashboard: [cyan]{url}[/cyan]")
+    console.print(f"\n  [dim]Ctrl+C to stop[/dim]\n")
+
+    if not no_browser:
+        def _open():
+            time.sleep(1.2)
+            webbrowser.open(url)
+        threading.Thread(target=_open, daemon=True).start()
+
+    uvicorn.run(
+        "hireagent.api.main:app",
+        host=host,
+        port=port,
+        reload=False,
+        log_level="warning",
+    )
+
+
+@app.command()
+def report(
+    min_score: int = typer.Option(7, "--min-score", help="Minimum fit score to include."),
+    limit: int = typer.Option(0, "--limit", "-l", help="Max jobs to show (0 = all)."),
+    output: Optional[str] = typer.Option(None, "--output", "-o", help="Output HTML path."),
+) -> None:
+    """Generate and open the apply-queue report (top jobs with apply links)."""
+    _bootstrap()
+
+    from hireagent.view import open_report
+
+    open_report(output_path=output, min_score=min_score, limit=limit)
+
+
+@app.command(name="export-profile")
+def export_profile(
+    output: Optional[str] = typer.Option(None, "--output", "-o", help="Output JSON path."),
+) -> None:
+    """Export your HireAgent profile as a JSON file ready to import into the Chrome extension."""
+    _bootstrap()
+
+    import json
+    from hireagent.config import PROFILE_PATH
+
+    if not PROFILE_PATH.exists():
+        console.print("[red]Profile not found.[/red] Run [bold]hireagent init[/bold] first.")
+        raise typer.Exit(code=1)
+
+    raw = json.loads(PROFILE_PATH.read_text(encoding="utf-8"))
+    p = raw.get("personal", {})
+    edu = raw.get("education", {})
+    masters = edu.get("masters", {})
+    exp = raw.get("experience", {})
+    comp = raw.get("compensation", {})
+    auth = raw.get("work_authorization", {})
+    eeo = raw.get("eeo_voluntary", {})
+
+    # Skills: pull from skills_boundary section (languages, frontend, backend, etc.)
+    skills_boundary = raw.get("skills_boundary", {})
+    all_skills: list[str] = []
+    for key in ("languages", "frontend", "backend", "ai_ml", "databases", "devops"):
+        v = skills_boundary.get(key, [])
+        if isinstance(v, list):
+            all_skills.extend(v)
+    # Deduplicate while preserving order
+    seen_s: set = set()
+    skills_deduped = [s for s in all_skills if not (s.lower() in seen_s or seen_s.add(s.lower()))]
+
+    full_name = p.get("full_name", "")
+    name_parts = full_name.split(" ", 1)
+    first = name_parts[0] if name_parts else ""
+    last  = name_parts[1] if len(name_parts) > 1 else ""
+
+    ext_profile = {
+        "firstName":      first,
+        "lastName":       last,
+        "email":          p.get("email", ""),
+        "phone":          p.get("phone", ""),
+        "address":        p.get("address", ""),
+        "city":           p.get("city", ""),
+        "state":          p.get("province_state", ""),
+        "zip":            p.get("postal_code", ""),
+        "country":        p.get("country", "United States"),
+        "linkedin":       p.get("linkedin_url", ""),
+        "github":         p.get("github_url", ""),
+        "website":        p.get("portfolio_url", ""),
+        "workAuth":       "OPT - no sponsorship needed" if auth.get("require_sponsorship") == "No" else auth.get("work_permit_type", ""),
+        "university":     masters.get("school", ""),
+        "degree":         masters.get("degree", "Master of Science"),
+        "major":          masters.get("field_primary", "Computer Science"),
+        "gradYear":       (masters.get("end_date", "") or "").split()[-1] if masters.get("end_date") else "",
+        "gpa":            masters.get("gpa", ""),
+        "currentCompany": exp.get("current_company", ""),
+        "currentTitle":   exp.get("current_job_title", ""),
+        "yearsExp":       exp.get("years_of_experience_total", "0-1"),
+        "targetRole":     exp.get("target_role", "Software Engineer"),
+        "targetSalary":   comp.get("salary_expectation", "90000"),
+        "skills":         skills_deduped[:30],
+        "gender":         eeo.get("gender", "Prefer not to say"),
+        "race":           eeo.get("race_ethnicity", "Prefer not to say"),
+    }
+
+    from hireagent.config import APP_DIR
+    out_path = Path(output) if output else APP_DIR / "extension_profile.json"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(ext_profile, indent=2), encoding="utf-8")
+
+    console.print(f"[green]Extension profile exported →[/green] {out_path}")
+    console.print("\n[bold]Next steps:[/bold]")
+    console.print("  1. Open Chrome → [bold]chrome://extensions[/bold]")
+    console.print("  2. Enable Developer Mode → Load unpacked → select [bold]extension/[/bold] folder")
+    console.print("  3. Click the HireAgent icon → Settings → Import from File")
+    console.print(f"  4. Select: [bold]{out_path}[/bold]")
 
 
 @debug_app.command("jobs")
@@ -716,6 +852,93 @@ def debug_reset_stale_in_progress(
             text = str(url)
             url_table.add_row(text if len(text) <= 180 else text[:177] + "...")
         console.print(url_table)
+
+
+@debug_app.command("purge-unavailable")
+def debug_purge_unavailable(
+    yes: bool = typer.Option(False, "--yes", help="Skip confirmation prompt."),
+) -> None:
+    """Delete expired, fake, and closed job listings from the database.
+
+    Removes jobs with statuses like 'expired', 'job_expired', 'fake_job_ssn',
+    and 'not_a_job_application' — listings that are permanently gone and will
+    never succeed on retry. Transient failures (captcha, login_issue) are kept.
+    """
+    _bootstrap()
+    from hireagent.database import get_connection, purge_unavailable_jobs
+
+    conn = get_connection()
+
+    if not yes:
+        confirmed = typer.confirm(
+            "Delete all expired/fake/closed jobs from the database? This cannot be undone."
+        )
+        if not confirmed:
+            console.print("[yellow]Aborted.[/yellow]")
+            raise typer.Exit(code=0)
+
+    result = purge_unavailable_jobs(conn=conn)
+
+    summary = Table(title="purge unavailable jobs", show_header=True, header_style="bold red")
+    summary.add_column("Metric")
+    summary.add_column("Value", justify="right")
+    summary.add_row("deleted", str(result["deleted"]))
+    console.print(summary)
+
+    if result["urls"]:
+        url_table = Table(title="deleted urls", show_header=True, header_style="bold magenta")
+        url_table.add_column("url")
+        for purged_url in result["urls"][:50]:
+            text = str(purged_url)
+            url_table.add_row(text if len(text) <= 180 else text[:177] + "...")
+        if len(result["urls"]) > 50:
+            console.print(f"[dim]  ... and {len(result['urls']) - 50} more[/dim]")
+        console.print(url_table)
+    else:
+        console.print("[green]No unavailable jobs found — database is clean.[/green]")
+
+
+@debug_app.command("rescue-expired")
+def debug_rescue_expired(
+    yes: bool = typer.Option(False, "--yes", help="Skip confirmation prompt."),
+) -> None:
+    """Rescue LinkedIn jobs wrongly marked as job_expired due to button-detection bugs.
+
+    Resets apply_status='job_expired' jobs back to NULL so they will be retried.
+    Use this after updating the Apply button detection logic to re-attempt jobs
+    that were permanently skipped due to timing/detection failures.
+    """
+    _bootstrap()
+    from hireagent.database import get_connection
+
+    conn = get_connection()
+    with conn:
+        cur = conn.execute(
+            "SELECT COUNT(*) FROM jobs WHERE apply_status = 'job_expired'"
+        )
+        count = cur.fetchone()[0]
+
+    if count == 0:
+        console.print("[green]No job_expired jobs found.[/green]")
+        return
+
+    console.print(f"Found [bold]{count}[/bold] jobs with apply_status='job_expired'.")
+
+    if not yes:
+        confirmed = typer.confirm(
+            f"Reset {count} job_expired jobs to retryable (apply_status=NULL, apply_attempts=0)?"
+        )
+        if not confirmed:
+            console.print("[yellow]Aborted.[/yellow]")
+            raise typer.Exit(code=0)
+
+    with conn:
+        conn.execute(
+            "UPDATE jobs SET apply_status = NULL, apply_attempts = 0, apply_error = NULL "
+            "WHERE apply_status = 'job_expired'"
+        )
+
+    console.print(f"[green]Rescued {count} jobs — they will be retried on next run.[/green]")
 
 
 @app.command()

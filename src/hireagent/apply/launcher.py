@@ -121,10 +121,20 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
     Returns:
         Job dict or None if the queue is empty.
     """
+    import time as _time
     conn = get_connection()
     policy = config.get_targeting_policy()
+    # Retry BEGIN IMMEDIATE up to 6x with 5s sleep — handles concurrent discovery pipeline writes
+    for _lock_attempt in range(6):
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            break
+        except Exception as _lock_err:
+            if "locked" not in str(_lock_err).lower() or _lock_attempt == 5:
+                raise
+            logger.debug("DB locked, retrying acquire_job in 5s (attempt %d/6)", _lock_attempt + 1)
+            _time.sleep(5)
     try:
-        conn.execute("BEGIN IMMEDIATE")
 
         if target_url:
             rows = conn.execute(
@@ -149,8 +159,17 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
                 params.extend(blocked_sites)
             url_clauses = ""
             if blocked_patterns:
-                url_clauses = " ".join(f"AND url NOT LIKE ?" for _ in blocked_patterns)
-                params.extend(blocked_patterns)
+                # Check both the scraped source URL and the application_url.
+                # Jobs from third-party boards (ZipRecruiter, SimplyHired, etc.) have
+                # their own URL as `url` but the employer's ATS URL as `application_url`.
+                # Without checking both, amazon.jobs / glassdoor etc. slip through.
+                url_clauses = " ".join(
+                    f"AND url NOT LIKE ? AND (application_url IS NULL OR application_url NOT LIKE ?)"
+                    for _ in blocked_patterns
+                )
+                for pat in blocked_patterns:
+                    params.append(pat)
+                    params.append(pat)
             # Optionally restrict to Greenhouse ATS only (includes grnh.se short URLs)
             greenhouse_clause = (
                 "AND (application_url LIKE '%greenhouse.io%' OR application_url LIKE '%grnh.se%')"
@@ -172,6 +191,16 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
                   {site_clause}
                   {url_clauses}
                 ORDER BY
+                  -- Tier 1: Ashby + Greenhouse first (best automation support)
+                  CASE WHEN application_url LIKE '%ashbyhq.com%'
+                            OR application_url LIKE '%jobs.ashby.io%'
+                            OR application_url LIKE '%greenhouse.io%'
+                            OR application_url LIKE '%grnh.se%' THEN 0
+                       -- Tier 2: Lever + generic ATSes
+                       WHEN application_url LIKE '%lever.co%' THEN 1
+                       -- Tier 3: everything else
+                       ELSE 2 END ASC,
+                  -- Deprioritize hard/manual ATSes within each tier
                   CASE WHEN application_url LIKE '%ultipro%' OR application_url LIKE '%ukg.com%'
                          OR application_url LIKE '%taleo%' OR application_url LIKE '%icims%'
                          OR application_url LIKE '%successfactors%' THEN 1
@@ -1253,21 +1282,22 @@ def _run_job_browser_use(job: dict, port: int, worker_id: int,
                 return f"upload_resume error: {_e}"
 
         # Build list of file paths the agent is allowed to upload
-        # Always prefer the master resume (Gunakarthik_Naidu_Lanka_Resume.pdf)
+        # Always use the master Desktop resume first — it's the clean, complete version
         available_files: list[str] = []
         from pathlib import Path as _Path
-        # Check both possible master resume locations
-        master_resume = config.OUTPUT_RESUME_DIR / "gunakarthik_naidu_lanka_resume.pdf"
-        worker_resume = _Path(os.path.expanduser("~/.hireagent/apply-workers/current/Gunakarthik_Naidu_Lanka_Resume.pdf"))
-        for mr in [master_resume, worker_resume]:
-            if mr.exists() and str(mr.resolve()) not in available_files:
-                available_files.append(str(mr.resolve()))
-        # Also add the job-specific tailored path as fallback
-        resume_path = job.get("tailored_resume_path")
-        if resume_path:
-            pdf = _Path(resume_path).with_suffix(".pdf")
-            if pdf.exists() and str(pdf.resolve()) not in available_files:
-                available_files.append(str(pdf.resolve()))
+        MASTER_RESUME = _Path("/Users/gunakarthik/Desktop/Gunakarthik_Naidu_Lanka_Resume.pdf")
+        TRANSCRIPT = _Path("/Users/gunakarthik/Downloads/SSR_TSRPT.pdf")
+        if MASTER_RESUME.exists():
+            available_files.append(str(MASTER_RESUME.resolve()))
+        if TRANSCRIPT.exists():
+            available_files.append(str(TRANSCRIPT.resolve()))
+        # Fallback resume locations
+        for fallback in [
+            config.OUTPUT_RESUME_DIR / "gunakarthik_naidu_lanka_resume.pdf",
+            _Path(os.path.expanduser("~/.hireagent/apply-workers/current/Gunakarthik_Naidu_Lanka_Resume.pdf")),
+        ]:
+            if fallback.exists() and str(fallback.resolve()) not in available_files:
+                available_files.append(str(fallback.resolve()))
         cl_path = job.get("cover_letter_path")
         if cl_path:
             cl = _Path(cl_path)
@@ -1463,7 +1493,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
 # ---------------------------------------------------------------------------
 
 PERMANENT_FAILURES: set[str] = {
-    "expired", "captcha", "login_issue",
+    "expired", "login_issue",
     "not_eligible_location", "not_eligible_salary",
     "already_applied", "account_required",
     "not_a_job_application", "unsafe_permissions",
@@ -1473,6 +1503,7 @@ PERMANENT_FAILURES: set[str] = {
     "fake_job_ssn",            # SSN requested — fake/scam posting, never apply
     "job_expired",             # LinkedIn job no longer accepting applications
     "indeed_hosted_not_ats",   # Indeed job listing page, not a real ATS form
+    "captcha",                 # Unsolvable Captcha
 }
 
 PERMANENT_PREFIXES: tuple[str, ...] = ("site_blocked", "cloudflare", "blocked_by")
@@ -1735,12 +1766,39 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
                 # Applied notification with screenshot is sent by free_agent._tg()
             else:
                 reason = result.split(":", 1)[-1] if ":" in result else result
+                is_permanent = _is_permanent_failure(result)
                 mark_result(job["url"], "failed", reason,
-                            permanent=_is_permanent_failure(result),
+                            permanent=is_permanent,
                             duration_ms=duration_ms)
                 # If SSN was requested, flag every job from this company as fake
                 if result == "fake_job_ssn":
                     _flag_fake_company(job)
+                # Immediately delete unavailable jobs (expired, fake, closed)
+                # from the DB so they don't pollute stats or queue
+                from hireagent.database import UNAVAILABLE_STATUSES, delete_job
+                _unavail_reason = reason.strip().lower()
+                # Auto-delete any job that hits a permanent/unrecoverable error —
+                # never let these pile up and block the queue.
+                _auto_delete_signals = (
+                    "expired", "no longer", "job closed",
+                    "position not found", "listing not found",
+                    "fake_job_ssn", "no_form_found",
+                    # Permanent infra failures — will never succeed on retry
+                    "account_required", "indeed_hosted_not_ats",
+                    "site_blocked", "cloudflare", "blocked_by",
+                    "us_citizen", "citizenship required", "security clearance",
+                    "manual ats",
+                )
+                if (result in UNAVAILABLE_STATUSES
+                        or _unavail_reason in UNAVAILABLE_STATUSES
+                        or is_permanent
+                        or any(sig in _unavail_reason for sig in _auto_delete_signals)):
+                    delete_job(url=job["url"])
+                    logger.info(
+                        "Purged job from DB: %s (%s) — %s",
+                        job.get("title", "?"), job.get("site", "?"), reason,
+                    )
+                    add_event(f"[W{worker_id}] 🗑️ Purged: {job['title'][:25]} ({reason[:20]})")
                 failed += 1
                 update_state(worker_id, jobs_failed=failed,
                              jobs_done=applied + failed)
@@ -1779,39 +1837,12 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
         if target_url:
             break
 
-        # ── Stealth Timing: Human-Mimetic Pacing ─────────────────────────────
+        # ── Gap between applications: 30–60 seconds ──────────────────────────
         if not _stop_event.is_set() and (continuous or limit == 0 or jobs_done < limit):
             import random as _random
-
-            if no_stealth:
-                # Fast mode: minimal 5-10 second gap (testing / watching)
-                gap_s = _random.randint(5, 10)
-                add_event(f"[W{worker_id}] ⚡ Fast mode — {gap_s}s gap")
-                _stop_event.wait(timeout=gap_s)
-            else:
-                # Every 4 applications: "Coffee Break" — deep sleep 45–75 min
-                if jobs_done % 4 == 0:
-                    coffee_sleep = _random.randint(45 * 60, 75 * 60)
-                    coffee_min = coffee_sleep // 60
-                    add_event(f"[W{worker_id}] ☕ Coffee break — sleeping {coffee_min}m before next job")
-                    update_state(worker_id, status="idle", last_action=f"coffee break ({coffee_min}m)")
-                    try:
-                        from hireagent.telegram_bot import notify
-                        notify(f"☕ HireAgent taking a {coffee_min}m break after {jobs_done} applications. Will resume shortly.")
-                    except Exception:
-                        pass
-                    if _stop_event.wait(timeout=coffee_sleep):
-                        break
-                else:
-                    # Standard gap: 12–22 min + session drift jitter of +/- 3 min
-                    base_gap = _random.randint(12 * 60, 22 * 60)
-                    jitter = _random.randint(-180, 180)
-                    total_gap = max(60, base_gap + jitter)  # never less than 60s
-                    gap_min = round(total_gap / 60, 1)
-                    add_event(f"[W{worker_id}] ⏱ Waiting {gap_min}m before next application")
-                    update_state(worker_id, status="idle", last_action=f"stealth gap ({gap_min}m)")
-                    if _stop_event.wait(timeout=total_gap):
-                        break
+            gap_s = _random.randint(30, 60)
+            add_event(f"[W{worker_id}] ⏱ {gap_s}s gap before next job")
+            _stop_event.wait(timeout=gap_s)
         # ─────────────────────────────────────────────────────────────────────
 
     # Kill the persistent Chrome now that the loop is done

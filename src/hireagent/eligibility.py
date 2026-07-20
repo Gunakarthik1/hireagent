@@ -74,6 +74,26 @@ SENIORITY_BLOCKERS = {
     "co-op",
     "coop",
     "co op",
+    # Mid-level / experienced markers
+    "mid-career",
+    "mid career",
+    "mid-level",
+    "mid level",
+    "midlevel",
+    "experienced",
+    # Roman numeral level suffixes — catches "SDE II", "Software Dev Engineer III", etc.
+    # Padded with spaces so " ii " matches in " software dev engineer ii " but not in "viii"
+    " ii ",
+    " iii ",
+    " iv ",
+    "sde ii",
+    "sde iii",
+    "engineer ii",
+    "engineer iii",
+    "software engineer ii",
+    "software engineer iii",
+    "developer ii",
+    "developer iii",
 }
 
 SOFTWARE_ROLE_MARKERS = {
@@ -218,6 +238,23 @@ VETERAN_MILITARY_BLOCKERS = {
     "must have active clearance",
 }
 
+# Jobs requiring US Citizenship (OPT/F-1 holders are ineligible)
+CITIZENSHIP_BLOCKERS = {
+    "must be a u.s. citizen",
+    "must be a us citizen",
+    "u.s. citizenship required",
+    "us citizenship required",
+    "united states citizenship required",
+    "requires u.s. citizenship",
+    "requires us citizenship",
+    "applicants must be citizens",
+    "must hold u.s. citizenship",
+    "only u.s. citizens",
+    "only us citizens",
+    "citizenship: u.s.",
+    "citizenship: us",
+}
+
 NON_US_MARKERS = {
     "united kingdom",
     "uk",
@@ -273,8 +310,11 @@ _EXP_REQUIREMENT_RE = re.compile(
     r"(\d+)\s*\+\s*years?\s*(?:of\s+)?(?:experience|exp)|"
     r"minimum\s+(?:of\s+)?(\d+)\s*years?\s*(?:of\s+)?(?:experience|exp)|"
     r"at\s+least\s+(\d+)\s*years?\s*(?:of\s+)?(?:experience|exp)|"
-    r"(?<![0-9\-])(\d+)\s*years?\s*(?:of\s+)?(?:\w+\s+){0,3}(?:experience|exp)"
+    # Broadened: allow hyphenated words ([\w-]+) and up to 8 filler words before "experience"
+    # e.g. "3+ years of non-internship professional software development experience"
+    r"(?<![0-9\-])(\d+)\s*\+?\s*years?\s*(?:of\s+)?(?:[\w-]+\s+){0,8}(?:experience|exp)"
 )
+
 
 _TITLE_LEVEL_BLOCKER_RE = re.compile(
     r"\b("
@@ -335,6 +375,23 @@ def _check_experience_requirement(job: dict) -> tuple[bool, str]:
     return True, "experience_ok_0_to_1_years_or_not_specified"
 
 
+_INTERNSHIP_DESCRIPTION_SIGNALS = (
+    # LinkedIn / jobspy job-type labels that appear in scraped description metadata
+    "job type: internship",
+    "employment type: internship",
+    "job type:internship",
+    "employment type:internship",
+    "**job type**\n internship",
+    "**employment type**\n internship",
+    # Common internship description markers
+    "this is an internship",
+    "summer internship",
+    "internship program",
+    "internship opportunity",
+    "internship position",
+)
+
+
 def _is_entry_level(job: dict) -> tuple[bool, str]:
     title = _norm(job.get("title"))
 
@@ -347,6 +404,12 @@ def _is_entry_level(job: dict) -> tuple[bool, str]:
 
     if _TITLE_LEVEL_BLOCKER_RE.search(title):
         return False, "title_level_blocker_detected"
+
+    # Some jobs have "Graduate" or similar titles but are actually internships — check
+    # the full description for explicit internship job-type markers.
+    desc_lower = (job.get("full_description") or job.get("description") or "").lower()
+    if any(sig in desc_lower for sig in _INTERNSHIP_DESCRIPTION_SIGNALS):
+        return False, "internship_in_description"
 
     # Accept anything that doesn't have seniority/PhD blockers (BS/MS roles)
     return True, "no_seniority_or_phd_blockers"
@@ -403,6 +466,15 @@ def _is_veteran_military_restricted(job: dict) -> tuple[bool, str]:
     hits = _hits(text, VETERAN_MILITARY_BLOCKERS)
     if hits:
         return False, f"veteran_military_restricted={','.join(hits[:3])}"
+    return True, "ok"
+
+
+def _is_citizenship_required(job: dict) -> tuple[bool, str]:
+    """Block roles that explicitly require US citizenship (OPT/F-1 holders ineligible)."""
+    desc = _norm(job.get("full_description"))
+    hits = _hits(desc, CITIZENSHIP_BLOCKERS)
+    if hits:
+        return False, f"citizenship_required={','.join(hits[:2])}"
     return True, "ok"
 
 
@@ -476,6 +548,7 @@ def classify_job_eligibility(job: dict, policy: dict | None = None) -> dict:
     software_ok, software_reason = _is_software_role(job)
     exp_ok, exp_reason = _check_experience_requirement(job)
     veteran_ok, veteran_reason = _is_veteran_military_restricted(job)
+    citizenship_ok, citizenship_reason = _is_citizenship_required(job)
 
     eligible_entry = entry_ok if policy.get("entry_level_only", True) else True
     eligible_us = us_ok if (policy.get("us_only", True) or policy.get("allow_us_remote_only", True)) else True
@@ -492,19 +565,22 @@ def classify_job_eligibility(job: dict, policy: dict | None = None) -> dict:
         reasons.append(f"experience:{exp_reason}")
     if not veteran_ok:
         reasons.append(f"restricted:{veteran_reason}")
+    if not citizenship_ok:
+        reasons.append(f"citizenship:{citizenship_reason}")
 
     return {
         "eligible_entry_level": eligible_entry,
         "eligible_us_location": eligible_us,
         "eligible_software_role": eligible_software,
         "eligible_experience": exp_ok,
-        "eligible_not_restricted": veteran_ok,
-        "final_eligible": eligible_entry and eligible_us and eligible_software and exp_ok and veteran_ok,
+        "eligible_not_restricted": veteran_ok and citizenship_ok,
+        "final_eligible": eligible_entry and eligible_us and eligible_software and exp_ok and veteran_ok and citizenship_ok,
         "entry_reason": entry_reason,
         "us_reason": us_reason,
         "software_reason": software_reason,
         "experience_reason": exp_reason,
         "veteran_reason": veteran_reason,
+        "citizenship_reason": citizenship_reason,
         "reasons": reasons,
     }
 
@@ -528,7 +604,10 @@ def classify_job_data_quality(job: dict) -> tuple[bool, str]:
     if location in {"remote country", "remote-country", "country remote"}:
         return False, "bad_data:malformed_location"
     if not application_url:
-        return False, "bad_data:missing_application_url"
+        # For LinkedIn jobs, the job URL itself is the apply URL — application_url is optional
+        job_url = _norm(job.get("url") or "")
+        if "linkedin.com" not in job_url:
+            return False, "bad_data:missing_application_url"
     if title in {site, "unknown", "n/a"}:
         return False, "bad_data:placeholder_title"
     return True, "ok"

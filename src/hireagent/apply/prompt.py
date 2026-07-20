@@ -217,7 +217,7 @@ Self-attestation / certification checkboxes ("I certify that the information abo
 
 SMS / text communication consent ("Do you consent to receiving text communications related to your job application via SMS", "May we contact you by text/SMS", or any similar opt-in for job-related texts) -> ALWAYS answer YES / consent. These are standard job application notifications, not spam.
 
-EEO/demographics -> Fill with actual answers from the APPLICANT PROFILE (Gender: Male, Race/Ethnicity: Asian, Hispanic: No, Veteran: No, Disability: No). Use "Prefer not to answer" ONLY if the exact matching option does not exist in the dropdown."""
+EEO/demographics -> Fill with actual answers from the APPLICANT PROFILE (Gender: Male, Race/Ethnicity: Asian, Hispanic: No, Veteran: No, Disability: No, I do not have a disability). NEVER select "I don't wish to answer", "Decline to self-identify", or "Prefer not to answer" for ANY EEO field. Always pick the actual answer (e.g. "Male", "Asian", "No, I do not have a disability", "I am not a protected veteran"). If the exact wording isn't available, pick the closest affirmative/negative match."""
 
 
 def _build_hard_rules(profile: dict) -> str:

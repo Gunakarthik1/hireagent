@@ -133,6 +133,33 @@ def init_db(db_path: Path | str | None = None) -> sqlite3.Connection:
             verification_confidence TEXT
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS resume_versions (
+            version_id    TEXT PRIMARY KEY,  -- 'A', 'B', 'C', ...
+            resume_text   TEXT,              -- full tailored resume text
+            resume_pdf_path TEXT,            -- path to the PDF
+            resume_tex_path TEXT,            -- path to the .tex source
+            base_keywords TEXT,              -- comma-separated key skills
+            role_cluster  TEXT,              -- 'backend', 'ml', 'fullstack', etc.
+            created_at    TEXT,
+            last_used_at  TEXT,
+            job_count     INTEGER DEFAULT 0  -- how many jobs use this version
+        )
+    """)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS version_jobs (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            version_id    TEXT NOT NULL,
+            job_url       TEXT NOT NULL,
+            ats_score     INTEGER,
+            matched_at    TEXT,
+            UNIQUE(version_id, job_url),
+            FOREIGN KEY (version_id) REFERENCES resume_versions(version_id),
+            FOREIGN KEY (job_url)    REFERENCES jobs(url)
+        )
+    """)
+
     conn.commit()
 
     # Run migrations for any columns added after initial schema
@@ -148,6 +175,7 @@ _ALL_COLUMNS: dict[str, str] = {
     # Discovery
     "url": "TEXT PRIMARY KEY",
     "title": "TEXT",
+    "company": "TEXT",
     "salary": "TEXT",
     "description": "TEXT",
     "location": "TEXT",
@@ -182,6 +210,10 @@ _ALL_COLUMNS: dict[str, str] = {
     "apply_duration_ms": "INTEGER",
     "apply_task_id": "TEXT",
     "verification_confidence": "TEXT",
+    # Resume versioning (version_manager stage)
+    "resume_version_id": "TEXT",
+    "version_ats_score": "INTEGER",
+    "version_assigned_at": "TEXT",
 }
 
 
@@ -321,6 +353,21 @@ def get_stats(conn: sqlite3.Connection | None = None) -> dict:
         "SELECT COUNT(*) FROM jobs WHERE apply_error IS NOT NULL"
     ).fetchone()[0]
 
+    # Mirrors the launcher's job-picker query: exclude blocked URL patterns
+    _blocked_patterns = [
+        "%amazon.jobs%", "%glassdoor%", "%google.com/about/careers%",
+        "%google.jobs%", "%accenture%", "%workopolis.com/out%",
+        "%jobs.gem.com%", "%apple.com/careers%", "%jobs.apple.com%",
+        "%nvidia.com/en-us/about-nvidia/careers%", "%nvidia.wd5.myworkdayjobs.com%",
+        "%nvidia.com/careers%",
+    ]
+    _url_not_clauses = " ".join(
+        "AND url NOT LIKE ? AND (application_url IS NULL OR application_url NOT LIKE ?)"
+        for _ in _blocked_patterns
+    )
+    _params = []
+    for p in _blocked_patterns:
+        _params.extend([p, p])
     stats["ready_to_apply"] = conn.execute(
         "SELECT COUNT(*) FROM jobs "
         "WHERE tailored_resume_path IS NOT NULL "
@@ -328,7 +375,8 @@ def get_stats(conn: sqlite3.Connection | None = None) -> dict:
         "AND application_url IS NOT NULL "
         "AND title IS NOT NULL AND TRIM(title) != '' "
         "AND location IS NOT NULL AND TRIM(location) != '' "
-        "AND (apply_status IS NULL OR apply_status IN ('failed'))"
+        f"AND (apply_status IS NULL OR apply_status IN ('failed')) {_url_not_clauses}",
+        _params,
     ).fetchone()[0]
 
     return stats
@@ -418,7 +466,7 @@ def get_jobs_by_stage(conn: sqlite3.Connection | None = None,
     elif "?" in where:
         params.append(7)  # default min_score
 
-    if min_score is not None and "fit_score" not in where and stage in ("scored", "tailored", "applied"):
+    if min_score is not None and "fit_score" not in where and stage in ("scored", "tailored", "applied", "pending_tailor", "pending_apply"):
         where += " AND fit_score >= ?"
         params.append(min_score)
 
@@ -818,3 +866,87 @@ def reset_stale_in_progress(
         "reset": len(reset_urls),
         "urls": reset_urls,
     }
+
+
+# Statuses that mean the job itself is gone (not a transient apply error).
+# Jobs with these statuses will never succeed on retry — they are dead listings.
+UNAVAILABLE_STATUSES: set[str] = {
+    "expired",
+    "job_expired",
+    "fake_job_ssn",
+    "not_a_job_application",
+}
+
+# apply_error substrings that also indicate the listing is dead
+UNAVAILABLE_ERROR_SIGNALS: tuple[str, ...] = (
+    "job_expired",
+    "expired",
+    "no longer accepting",
+    "position not found",
+    "no longer available",
+    "job closed",
+    "posting expired",
+    "listing not found",
+    "fake_job_ssn",
+)
+
+
+def purge_unavailable_jobs(conn: sqlite3.Connection | None = None) -> dict:
+    """Delete jobs from the DB that are known to be unavailable (expired, fake, closed).
+
+    This removes dead listings entirely so they don't pollute stats, dashboards,
+    or apply-queue queries. Only jobs that are genuinely gone are deleted — transient
+    failures (captcha, login_issue, etc.) are preserved for retry.
+
+    Args:
+        conn: Database connection. Uses get_connection() if None.
+
+    Returns:
+        {"deleted": int, "urls": list[str]} with counts and URLs of purged jobs.
+    """
+    if conn is None:
+        conn = get_connection()
+
+    # Build the WHERE clause: match by apply_status OR by apply_error content
+    status_placeholders = ",".join("?" * len(UNAVAILABLE_STATUSES))
+    error_clauses = " OR ".join("LOWER(apply_error) LIKE ?" for _ in UNAVAILABLE_ERROR_SIGNALS)
+
+    query = f"""
+        SELECT url, title, site, apply_status, apply_error
+        FROM jobs
+        WHERE applied_at IS NULL
+          AND (
+            apply_status IN ({status_placeholders})
+            OR ({error_clauses})
+          )
+    """
+    params: list = list(UNAVAILABLE_STATUSES) + [f"%{sig}%" for sig in UNAVAILABLE_ERROR_SIGNALS]
+    rows = conn.execute(query, params).fetchall()
+
+    purged_urls: list[str] = []
+    for row in rows:
+        url = row["url"]
+        conn.execute("DELETE FROM jobs WHERE url = ?", (url,))
+        purged_urls.append(url)
+
+    if purged_urls:
+        conn.commit()
+
+    return {"deleted": len(purged_urls), "urls": purged_urls}
+
+
+def delete_job(conn: sqlite3.Connection | None = None, url: str = "") -> bool:
+    """Delete a single job from the DB by URL.
+
+    Args:
+        conn: Database connection. Uses get_connection() if None.
+        url: The job URL (primary key) to delete.
+
+    Returns:
+        True if a row was deleted, False if no matching row found.
+    """
+    if conn is None:
+        conn = get_connection()
+    cursor = conn.execute("DELETE FROM jobs WHERE url = ?", (url,))
+    conn.commit()
+    return cursor.rowcount > 0

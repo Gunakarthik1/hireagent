@@ -258,14 +258,14 @@ class ClaudeClient:
 # ── Stage-Specific Client Getters ─────────────────────────────────────────
 
 def get_score_client():
-    """Stage 3 (SCORE): NVIDIA DeepSeek-V3.1, fallback to Ollama llama3:8b."""
+    """Stage 3 (SCORE): NVIDIA DeepSeek-V3.2, fallback to Ollama llama3:8b."""
     if os.environ.get("NVIDIA_API_KEY"):
         try:
             client = NvidiaClient(
-                model="deepseek-ai/deepseek-v3.1",
+                model="deepseek-ai/deepseek-v3.2",
                 fallback_model=os.environ.get("LLM_MODEL", "llama3:8b"),
             )
-            log.info("Score LLM: NVIDIA deepseek-ai/deepseek-v3.1")
+            log.info("Score LLM: NVIDIA deepseek-ai/deepseek-v3.2")
             return client
         except Exception as e:
             log.warning("NVIDIA score client init failed (%s), using Ollama", e)
@@ -275,14 +275,14 @@ def get_score_client():
 
 
 def get_tailor_client():
-    """Stage 4 (TAILOR): NVIDIA DeepSeek-R1-Distill-Qwen-14B, fallback to Ollama."""
+    """Stage 4 (TAILOR): NVIDIA DeepSeek-V3.2, fallback to Ollama."""
     if os.environ.get("NVIDIA_API_KEY"):
         try:
             client = NvidiaClient(
-                model="deepseek-ai/deepseek-r1-distill-qwen-14b",
+                model="deepseek-ai/deepseek-v3.2",
                 fallback_model=os.environ.get("LLM_MODEL", "llama3:8b"),
             )
-            log.info("Tailor LLM: NVIDIA deepseek-ai/deepseek-r1-distill-qwen-14b")
+            log.info("Tailor LLM: NVIDIA deepseek-ai/deepseek-v3.2")
             return client
         except Exception as e:
             log.warning("NVIDIA tailor client init failed (%s), using Ollama", e)
@@ -292,14 +292,14 @@ def get_tailor_client():
 
 
 def get_cover_client():
-    """Stage 5 (COVER): NVIDIA DeepSeek-R1-Distill-Qwen-14B, fallback to Ollama."""
+    """Stage 5 (COVER): NVIDIA DeepSeek-V3.2, fallback to Ollama."""
     if os.environ.get("NVIDIA_API_KEY"):
         try:
             client = NvidiaClient(
-                model="deepseek-ai/deepseek-r1-distill-qwen-14b",
+                model="deepseek-ai/deepseek-v3.2",
                 fallback_model=os.environ.get("LLM_MODEL", "llama3:8b"),
             )
-            log.info("Cover LLM: NVIDIA deepseek-ai/deepseek-r1-distill-qwen-14b")
+            log.info("Cover LLM: NVIDIA deepseek-ai/deepseek-v3.2")
             return client
         except Exception as e:
             log.warning("NVIDIA cover client init failed (%s), using Ollama", e)
@@ -330,25 +330,82 @@ def get_select_client():
     return OllamaClient(model=model)
 
 
-def get_apply_client():
-    """Stage 7 (APPLY form fill): NVIDIA → Ollama (no Anthropic, no paid APIs).
+class OpenRouterClient:
+    """OpenRouter API client — free models via openrouter.ai."""
 
-    NVIDIA NIM free tier is used when NVIDIA_API_KEY is set.
-    Falls back to local Ollama (completely free, no API key needed).
+    _BASE_URL = "https://openrouter.ai/api/v1"
+
+    def __init__(self, model: str | None = None) -> None:
+        from openai import OpenAI
+        api_key = os.environ.get("OPENROUTER_API_KEY", "")
+        if not api_key:
+            raise RuntimeError("OPENROUTER_API_KEY not set")
+        self._client = OpenAI(
+            api_key=api_key,
+            base_url=self._BASE_URL,
+            default_headers={"HTTP-Referer": "https://hireagent.local"},
+        )
+        # Default: best free reasoning model for form fill JSON
+        self.model = model or os.environ.get(
+            "OPENROUTER_MODEL",
+            "deepseek/deepseek-r1:free",  # free, strong reasoning
+        )
+        self.base_url = self._BASE_URL
+
+    def chat(self, messages: list[dict], temperature: float = 0.1,
+             max_tokens: int = 2048) -> str:
+        try:
+            response = self._client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+            content = response.choices[0].message.content or ""
+            return strip_thinking_tags(content)
+        except Exception as e:
+            log.error("OpenRouter error (model=%s): %s", self.model, e)
+            return ""
+
+    def ask(self, prompt: str, temperature: float = 0.1, max_tokens: int = 2048,
+            system_prompt: str | None = None) -> str:
+        messages: list[dict] = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": prompt})
+        return self.chat(messages, temperature=temperature, max_tokens=max_tokens)
+
+
+def get_apply_client():
+    """Stage 7 (APPLY form fill): OpenRouter free → NVIDIA free → Ollama local.
+
+    Priority:
+      1. OpenRouter (OPENROUTER_API_KEY) — deepseek-r1:free or any :free model
+      2. NVIDIA NIM (NVIDIA_API_KEY)     — llama-3.1-70b-instruct, free tier
+      3. Ollama local                    — qwen3.5:latest
     """
+    if os.environ.get("OPENROUTER_API_KEY"):
+        try:
+            client = OpenRouterClient()
+            log.info("Apply form LLM: OpenRouter %s", client.model)
+            return client
+        except Exception as e:
+            log.warning("OpenRouter apply client init failed (%s)", e)
+
     if os.environ.get("NVIDIA_API_KEY"):
         try:
-            # llama-3.1-70b gives best JSON reliability; 8b is faster fallback
             model = os.environ.get("APPLY_LLM_MODEL", "meta/llama-3.1-70b-instruct")
             client = NvidiaClient(
                 model=model,
-                fallback_model=os.environ.get("LLM_MODEL", "llama3:8b"),
+                fallback_model=os.environ.get("LLM_MODEL", "qwen3.5:latest"),
             )
             log.info("Apply form LLM: NVIDIA %s", model)
             return client
         except Exception as e:
             log.warning("NVIDIA apply client init failed (%s), using Ollama", e)
-    model = os.environ.get("LLM_MODEL", "llama3:8b")
+
+    # qwen3.5 has better instruction-following for form-fill JSON than llama3:8b
+    model = os.environ.get("APPLY_LLM_MODEL", os.environ.get("LLM_MODEL", "qwen3.5:latest"))
     log.info("Apply form LLM: Ollama %s", model)
     return OllamaClient(model=model)
 
@@ -375,6 +432,7 @@ def get_tailor_token_summary() -> dict:
 __all__ = [
     "strip_thinking_tags",
     "NvidiaClient",
+    "OpenRouterClient",
     "get_apply_client",
     "OllamaClient",
     "GeminiClient",

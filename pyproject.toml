@@ -28,6 +28,9 @@ dependencies = [
     "python-dotenv>=1.0",
     "pyyaml>=6.0",
     "pandas>=2.0",
+    "fastapi>=0.111",
+    "uvicorn[standard]>=0.29",
+    "python-jobspy>=1.1.80",
     ]
 
 [project.optional-dependencies]

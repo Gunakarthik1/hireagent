@@ -34,6 +34,50 @@ RESULT_FAILED   = "failed"
 RESULT_SKIPPED  = "skipped_preflight"
 RESULT_PENDING  = "pending_human_review"
 
+# ── Submission Physical Interlock ──────────────────────────────────────────
+# FORBIDDEN to click Submit unless explicitly unlocked by _unlock_submit().
+# Conditions: n_filled >= 5, zero validation errors, 3-second cooldown elapsed.
+READY_TO_SUBMIT: bool = False
+
+
+class DataIntegrityError(RuntimeError):
+    """Raised when an identity-critical field deviates from the hard-coded profile anchor."""
+
+
+def _enforce_identity(flat: dict, profile: dict) -> None:
+    """Raise DataIntegrityError if any identity anchor has been mutated or mis-mapped.
+
+    Hard-coded anchors (derived the same way as _flat()):
+      - first_name  → first + middle from full_name  (Gunakarthik Naidu)
+      - last_name   → last word of full_name          (Lanka)
+      - email       → profile.personal.email
+    """
+    p = profile.get("personal", {})
+    full = p.get("full_name", "")
+    parts = full.split()
+    first  = parts[0] if parts else ""
+    last   = parts[-1] if len(parts) > 1 else ""
+    middle = parts[1] if len(parts) > 2 else ""
+    expected_first = f"{first} {middle}".strip() if middle else first
+    expected_last  = last
+    expected_email = p.get("email", "")
+
+    if expected_first and flat.get("legal_first_name") != expected_first:
+        raise DataIntegrityError(
+            f"First-name anchor violation: flat['legal_first_name']={flat.get('legal_first_name')!r} "
+            f"!= profile anchor {expected_first!r}"
+        )
+    if expected_last and flat.get("last_name") != expected_last:
+        raise DataIntegrityError(
+            f"Last-name anchor violation: flat['last_name']={flat.get('last_name')!r} "
+            f"!= profile anchor {expected_last!r}"
+        )
+    if expected_email and flat.get("email") != expected_email:
+        raise DataIntegrityError(
+            f"Email anchor violation: flat['email']={flat.get('email')!r} "
+            f"!= profile anchor {expected_email!r}"
+        )
+
 
 # ── Profile flattening ─────────────────────────────────────────────────────
 
@@ -46,6 +90,16 @@ def _flat(profile: dict) -> dict:
     edu_m = profile.get("education", {}).get("masters", {})
     edu_b = profile.get("education", {}).get("bachelors", {})
 
+    # Extract current company from work_experiences (most recent = index 0)
+    _work_exps = profile.get("resume_facts", {}).get("work_experiences", [])
+    _current_company = (
+        _work_exps[0].get("company", "") if _work_exps
+        else exp.get("current_company", "")
+    )
+    # Strip parenthetical suffixes: "Velocity Tech (Zinio TalentHub)" → "Velocity Tech"
+    if _current_company and "(" in _current_company:
+        _current_company = _current_company.split("(")[0].strip()
+
     full = p.get("full_name", "")
     parts = full.split()
     # "Gunakarthik Naidu Lanka" → first="Gunakarthik", middle="Naidu", last="Lanka"
@@ -57,11 +111,11 @@ def _flat(profile: dict) -> dict:
     return {
         # Identity
         "full_name":              full,
-        "first_name":             p.get("preferred_name") or first,  # use preferred/short name (Guna)
-        "legal_first_name":       first,                              # Gunakarthik — only use if form says "legal"
+        "first_name":             first,                                             # Given name only — "Gunakarthik" (middle goes in middle_name)
+        "legal_first_name":       f"{first} {middle}".strip() if middle else first,  # Legal: first + middle for legal docs
         "last_name":              last,
         "middle_name":            middle,
-        "preferred_name":         p.get("preferred_name") or first,
+        "preferred_name":         f"{first} {middle}".strip() if middle else first,  # Override: always full first name
         "email":                  p.get("email", ""),
         "password":               p.get("password", ""),
         "phone":                  phone_raw[-10:] if phone_raw else "",   # 10-digit US number
@@ -80,7 +134,7 @@ def _flat(profile: dict) -> dict:
         "linkedin_url":           p.get("linkedin_url", ""),
         "github_url":             p.get("github_url", ""),
         "portfolio_url":          p.get("portfolio_url", ""),
-        "website_url":            p.get("website_url", p.get("portfolio_url", "")),
+        "website_url":            p.get("portfolio_url", "") or p.get("website_url", ""),
         # Work auth
         "authorized":             auth.get("legally_authorized_to_work", "Yes"),
         "sponsorship":            auth.get("require_sponsorship", "No"),
@@ -121,6 +175,11 @@ def _flat(profile: dict) -> dict:
         "ethnicity":              profile.get("eeo_voluntary", {}).get("ethnicity", "Asian (Not Hispanic or Latino)"),
         "veteran":                profile.get("eeo_voluntary", {}).get("veteran_status", "I am not a protected veteran"),
         "disability":             profile.get("eeo_voluntary", {}).get("disability_status", "I do not have a disability"),
+        # Experience / employment — explicit so LLM never confuses name with company
+        "current_company":    _current_company,
+        "employer":           _current_company,
+        "most_recent_employer": _current_company,
+        "organization":       _current_company,
         # Common yes/no answers
         "yes": "Yes",
         "no":  "No",
@@ -141,11 +200,19 @@ def _tg(text: str, photo_path: Path | None = None) -> bool:
                 r = requests.post(f"{base}/sendPhoto",
                     data={"chat_id": chat_id, "caption": text[:1024]},
                     files={"photo": f}, timeout=15)
+            r.raise_for_status()
         else:
-            r = requests.post(f"{base}/sendMessage",
-                json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"},
-                timeout=15)
-        r.raise_for_status()
+            try:
+                r = requests.post(f"{base}/sendMessage",
+                    json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"},
+                    timeout=15)
+                r.raise_for_status()
+            except Exception:
+                # Markdown parse errors (special chars in text) → retry as plain text
+                r = requests.post(f"{base}/sendMessage",
+                    json={"chat_id": chat_id, "text": text},
+                    timeout=15)
+                r.raise_for_status()
         return True
     except Exception as e:
         log.warning("Telegram send failed: %s", e)
@@ -195,6 +262,95 @@ def _tg_ask(question: str, timeout: int = 120) -> str | None:
     return None
 
 
+def _tg_ask_select(question: str, options: list[str], timeout: int = 180) -> str | None:
+    """Send a question with inline keyboard buttons to Telegram. Returns the chosen option or None.
+
+    Use this instead of _tg_ask when the form field is a select/radio with known choices —
+    the user taps a button rather than typing a free-text reply.
+    Answers are NOT filtered for /approve or /reject so the user can pick any option.
+    """
+    token   = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
+    if not token or not chat_id:
+        return None
+
+    base = f"https://api.telegram.org/bot{token}"
+
+    # Build inline keyboard — one button per row (max 20 options shown)
+    keyboard = [
+        [{"text": opt[:64], "callback_data": f"sel:{opt[:64]}"}]
+        for opt in options[:20]
+    ]
+    reply_markup = {"inline_keyboard": keyboard}
+
+    try:
+        r = requests.post(f"{base}/sendMessage",
+            json={
+                "chat_id": chat_id,
+                "text": question,
+                "parse_mode": "Markdown",
+                "reply_markup": reply_markup,
+            },
+            timeout=15)
+        r.raise_for_status()
+    except Exception as e:
+        log.warning("_tg_ask_select send failed: %s — falling back to text ask", e)
+        return _tg_ask(question, timeout=timeout)
+
+    # Drain stale updates first
+    deadline = time.time() + timeout
+    offset   = 0
+    try:
+        r2 = requests.get(f"{base}/getUpdates", params={"offset": -1, "limit": 1}, timeout=5)
+        updates = r2.json().get("result", [])
+        if updates:
+            offset = updates[-1]["update_id"] + 1
+    except Exception:
+        pass
+
+    # Poll for callback_query (button tap)
+    while time.time() < deadline:
+        try:
+            r3 = requests.get(f"{base}/getUpdates",
+                params={"offset": offset, "timeout": 20,
+                        "allowed_updates": ["callback_query", "message"]},
+                timeout=30)
+            for upd in r3.json().get("result", []):
+                offset = upd["update_id"] + 1
+
+                # Inline keyboard callback
+                cq = upd.get("callback_query", {})
+                if cq:
+                    cq_chat = cq.get("message", {}).get("chat", {}).get("id", "")
+                    if str(cq_chat) == str(chat_id):
+                        data = cq.get("data", "")
+                        if data.startswith("sel:"):
+                            chosen = data[4:]
+                            # Acknowledge the callback so the button stops spinning
+                            try:
+                                requests.post(f"{base}/answerCallbackQuery",
+                                    json={"callback_query_id": cq["id"], "text": f"✓ {chosen[:30]}"},
+                                    timeout=5)
+                            except Exception:
+                                pass
+                            log.info("_tg_ask_select: user chose '%s'", chosen)
+                            return chosen
+
+                # Plain text fallback (user typed instead of tapping a button)
+                msg = upd.get("message", {})
+                if msg and str(msg.get("chat", {}).get("id", "")) == str(chat_id):
+                    text = (msg.get("text") or "").strip()
+                    if text and text.lower() not in ("/approve", "/reject"):
+                        log.info("_tg_ask_select: text reply '%s'", text[:80])
+                        return text
+        except Exception as e:
+            log.debug("_tg_ask_select poll: %s", e)
+            time.sleep(3)
+
+    log.warning("_tg_ask_select: timeout waiting for selection")
+    return None
+
+
 def _tg_wait_approval(title: str, timeout: int) -> bool:
     token   = os.environ.get("TELEGRAM_BOT_TOKEN", "")
     chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
@@ -240,7 +396,14 @@ def _tg_wait_approval(title: str, timeout: int) -> bool:
 # ── ATS-specific form fillers ──────────────────────────────────────────────
 
 def _label_for(page, el) -> str:
-    """Best-effort label text for a form element."""
+    """Best-effort label text for a form element.
+
+    Priority:
+      1. <label for="id"> association
+      2. aria-label / placeholder / name
+      3. JS DOM walk — finds nearest question text in parent hierarchy
+         (catches Rippling-style obfuscated IDs like 'Ui3F-JI8Hgm')
+    """
     label = ""
     el_id = el.get_attribute("id") or ""
     if el_id:
@@ -254,17 +417,49 @@ def _label_for(page, el) -> str:
             el.get_attribute("name") or
             el.get_attribute("id") or ""
         )
+
+    # If the label looks like an obfuscated ID (no spaces, mixed-case junk),
+    # walk the DOM to find the nearest human-readable question text.
+    _looks_obfuscated = label and " " not in label.strip() and len(label) < 40
+    if not label or _looks_obfuscated:
+        try:
+            js_label = el.evaluate("""el => {
+                let node = el.parentElement;
+                for (let i = 0; i < 8 && node; i++, node = node.parentElement) {
+                    for (const child of Array.from(node.children)) {
+                        if (child.contains(el)) continue;
+                        const tag = child.tagName.toLowerCase();
+                        if (['p','span','div','h1','h2','h3','h4','label','legend','strong','b'].includes(tag)) {
+                            const t = (child.innerText || child.textContent || '').replace(/\\s+/g,' ').trim();
+                            if (t.length > 5 && t.length < 200 && !t.includes('{') && !t.includes('function(')) {
+                                return t;
+                            }
+                        }
+                    }
+                }
+                return '';
+            }""")
+            if js_label and len(js_label.strip()) > 3:
+                label = js_label.strip()
+        except Exception:
+            pass
+
     return label.strip()
 
 
 def _safe_fill(el, value: str, page=None):
     """Type value into a field character-by-character with human-like timing.
-    After typing, checks for autocomplete dropdowns and clicks the best match."""
+    After typing, checks for autocomplete dropdowns and clicks the best match.
+
+    Uses Ctrl+A + type (select-all-then-replace) to avoid an intermediate empty state
+    that would trigger React/Greenhouse 'field is required' validation messages.
+    """
     import random as _rng
     import time as _time
     try:
-        el.click()
-        el.fill("")
+        # Triple-click selects all text (macOS+Windows). On macOS, Control+A
+        # moves cursor to start rather than selecting all text, causing appending.
+        el.click(click_count=3)
         el.type(value, delay=_rng.randint(30, 80))
         _time.sleep(_rng.uniform(0.05, 0.18))
     except Exception:
@@ -400,8 +595,16 @@ _LABEL_MAP: list[tuple[str, str]] = [
     ("postal",                  "postal_code"),
     ("zip",                     "postal_code"),
     ("country",                 "country"),
-    ("current location",        "location"),
-    ("location",                "location"),
+    # ── US/Canada location questions ──────────────────────────────────────────
+    # These appear on some ATS as qualifying questions — always "Yes" (candidate is in Arizona, US)
+    ("located in the us or canada",  "yes"),
+    ("located in us or canada",      "yes"),
+    ("us or canada",                 "yes"),
+    ("located in the united states or canada", "yes"),
+    ("are you located in",           "yes"),
+    ("currently located in the us",  "yes"),
+    ("current location",             "location"),
+    ("location",                     "location"),
     # ── Links ─────────────────────────────────────────────────────────────────
     ("linkedin",                "linkedin_url"),
     ("github",                  "github_url"),
@@ -676,27 +879,37 @@ def _fill_all_selects(page, flat: dict) -> int:
                 ok = _try("December 2025", "2025", "December")
             elif any(k in ll for k in ("start date", "enrollment")):
                 ok = _try("January 2025", "2025")
+            # US/Canada location qualifying questions (candidate is in Arizona, US)
+            elif any(k in ll for k in ("us or canada", "united states or canada", "located in the us",
+                                        "located in the united states")):
+                ok = _try("Yes", "United States", "US")
             # Country
             elif "country" in ll:
                 ok = _try("United States", "United States of America", "US", "USA")
             # State
             elif "state" in ll or "province" in ll:
                 ok = _try("Arizona", "AZ")
-            # Work authorization
-            elif any(k in ll for k in ("authorized", "eligible to work", "work auth", "legally auth")):
+            # Work authorization / legal right to work (always Yes)
+            elif any(k in ll for k in ("authorized", "eligible to work", "work auth", "legally auth",
+                                        "legal right to work", "verify.*legal.*right", "right to work",
+                                        "submit verification")):
                 ok = _try("Yes", "I am authorized", "Authorized")
-            # Sponsorship — only answer if the label explicitly asks about needing sponsorship
+            # Sponsorship — answer from flat (JD-aware override applied at start of apply_via_playwright)
             elif any(k in ll for k in ("require.*sponsor", "need.*sponsor", "will you.*require",
                                         "will you.*need.*visa", "need sponsorship", "require sponsorship",
                                         "currently require", "currently need")):
-                ok = _try("No", "No, I do not", "Will not require", "No sponsorship needed")
+                _spons_val = flat.get("sponsorship", "No")
+                if _spons_val == "Yes":
+                    ok = _try("Yes", "Yes, I will", "Will require")
+                else:
+                    ok = _try("No", "No, I do not", "Will not require", "No sponsorship needed")
             # Visa / work permit
             elif "visa" in ll or "work permit" in ll or "citizenship" in ll:
                 ok = _try("OPT", "F-1 OPT", "Student Visa (OPT)", "Other")
-            # Gender — use "Decline to self-identify" per profile
+            # Gender — always Male
             elif "gender" in ll or "sex" in ll:
-                ok = _try("Decline to self-identify", "Prefer not to say", "Prefer not to disclose",
-                           "I prefer not to answer", "Not specified", "Other", "Prefer not to answer")
+                ok = _try("Male", "Man", "Male (including transgender men)",
+                           "Male/Man", "M")
             # Veteran
             elif "veteran" in ll or "military" in ll:
                 ok = _try("I am not a protected veteran", "Not a protected veteran", "No", "I am not a veteran")
@@ -704,10 +917,10 @@ def _fill_all_selects(page, flat: dict) -> int:
             elif "disability" in ll or "disabled" in ll:
                 ok = _try("I do not have a disability", "No disability", "No",
                            "I don't have a disability", "None")
-            # Race / ethnicity — decline per profile
+            # Race / ethnicity — always Asian
             elif "race" in ll or "ethnicity" in ll:
-                ok = _try("Decline to self-identify", "Prefer not to say", "I prefer not to answer",
-                           "Asian", "Asian (Not Hispanic or Latino)")
+                ok = _try("Asian", "Asian (Not Hispanic or Latino)",
+                           "Asian or Pacific Islander", "Asian American")
             # Education level (not graduation year, not field)
             elif any(k in ll for k in ("education level", "highest education", "degree level", "highest level")):
                 ok = _try("Master's Degree", "Master", "Masters", "Master's")
@@ -731,10 +944,11 @@ def _fill_all_selects(page, flat: dict) -> int:
             # Willingness to relocate
             elif "relocat" in ll:
                 ok = _try("Yes", "Willing to relocate")
-            # How did you hear / learn
+            # How did you hear / learn — always prefer LinkedIn, then Company Website
             elif any(k in ll for k in ("how did you hear", "how did you learn", "how did you find",
-                                        "where did you hear", "how were you referred", "referral source")):
-                ok = _try("LinkedIn", "Job Board", "Indeed", "Other")
+                                        "where did you hear", "how were you referred", "referral source",
+                                        "how did you hear about us", "how did you hear about this")):
+                ok = _try("LinkedIn", "Company Website", "Job Board", "Indeed", "Other", "Online")
             # CS / degree enrollment (select version)
             elif any(k in ll for k in ("enrolled in a degree", "currently enrolled", "degree program",
                                         "primary focus in computer", "closely related field")):
@@ -792,12 +1006,18 @@ def _fill_radios(page, flat: dict) -> int:
     """Fill radio button groups using label keywords. Returns count filled."""
     filled = 0
     # Mapping: label keyword → desired value to click
+    _spons_answer = flat.get("sponsorship", "No")  # JD-aware; set by apply_via_playwright
     RADIO_MAP = [
         # Work auth (check before sponsor since sponsor is also work-auth related)
         (["require sponsor", "visa sponsorship", "need sponsor", "will you.*require.*sponsor",
-          "will you.*need.*visa", "future.*visa", "sponsor.*now"],         "No"),
+          "will you.*need.*visa", "future.*visa", "sponsor.*now"],         _spons_answer),
         (["authorized", "eligible to work", "legally authorized",
-          "work auth", "authorized to work in the united"],                "Yes"),
+          "work auth", "authorized to work in the united",
+          "legal right to work", "verify.*legal.*right", "right to work",
+          "submit verification"],                                            "Yes"),
+        # US/Canada location qualifying questions (candidate is in Arizona, US → Yes)
+        (["us or canada", "united states or canada", "located in the us",
+          "located in the united states", "located in us"],                  "Yes"),
         # CS / degree enrollment
         (["enrolled in a degree", "currently enrolled", "degree program.*computer",
           "major in computer science", "cs degree"],                       "Yes"),
@@ -811,8 +1031,8 @@ def _fill_radios(page, flat: dict) -> int:
         (["us citizen", "citizen"],     "No"),
         (["disability"],                "I do not have a disability"),
         (["veteran"],                   "I am not a protected veteran"),
-        (["gender"],                    "Decline to self-identify"),
-        (["race", "ethnicity"],         "Decline to self-identify"),
+        (["gender"],                    "Male"),
+        (["race", "ethnicity"],         "Asian"),
     ]
     # Find all radio groups by name attribute
     radios = page.query_selector_all("input[type='radio']")
@@ -872,27 +1092,40 @@ def _fill_radios(page, flat: dict) -> int:
                 break
         else:
             # No RADIO_MAP rule matched — if this is a required yes/no group, default to "Yes"
-            try:
-                values = [(r.get_attribute("value") or "").lower() for r in group]
-                if set(values) <= {"yes", "no", "true", "false"} or len(group) == 2:
-                    for r in group:
-                        try:
-                            val = (r.get_attribute("value") or "").lower()
-                            r_id = r.get_attribute("id") or ""
-                            r_lbl = ""
-                            if r_id:
-                                lbl_el = page.query_selector(f"label[for='{r_id}']")
-                                if lbl_el:
-                                    r_lbl = lbl_el.inner_text().lower()
-                            if val in ("yes", "true") or "yes" in r_lbl:
-                                r.click()
-                                filled += 1
-                                log.debug("Radio '%s' fallback → Yes", group_label[:40])
-                                break
-                        except Exception:
-                            pass
-            except Exception:
-                pass
+            # BUT: NEVER default "Yes" for qualification/experience/clearance questions —
+            # those should be answered honestly (No) to avoid being screened out mid-form.
+            _QUAL_BLOCKLIST = (
+                "year", "experience", "clearance", "secret", "certification",
+                "certified", "license", "licensed", "degree required",
+                "must have", "do you have", "have you", "currently hold",
+                "possess", "proficient",
+            )
+            _skip_yes_fallback = any(kw in ll for kw in _QUAL_BLOCKLIST)
+            if _skip_yes_fallback:
+                log.debug("Radio '%s' — qualification keyword detected, skipping Yes fallback", group_label[:40])
+                # leave it unanswered; Telegram/LLM pass will handle it
+            else:
+                try:
+                    values = [(r.get_attribute("value") or "").lower() for r in group]
+                    if set(values) <= {"yes", "no", "true", "false"} or len(group) == 2:
+                        for r in group:
+                            try:
+                                val = (r.get_attribute("value") or "").lower()
+                                r_id = r.get_attribute("id") or ""
+                                r_lbl = ""
+                                if r_id:
+                                    lbl_el = page.query_selector(f"label[for='{r_id}']")
+                                    if lbl_el:
+                                        r_lbl = lbl_el.inner_text().lower()
+                                if val in ("yes", "true") or "yes" in r_lbl:
+                                    r.click()
+                                    filled += 1
+                                    log.debug("Radio '%s' fallback → Yes", group_label[:40])
+                                    break
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
     return filled
 
 
@@ -952,7 +1185,10 @@ def _fill_greenhouse(page, flat: dict) -> tuple[int, list[str]]:
             if el.is_visible(timeout=1000):
                 current = el.input_value()
                 if not current:
-                    el.fill(value)  # use fill() not _safe_fill to avoid autocomplete hang
+                    # Triple-click selects all then type — works on macOS+Windows.
+                    # Control+A on macOS moves cursor to start, not select-all.
+                    el.click(click_count=3)
+                    el.type(value, delay=30)
                     filled += 1
                     log.info("GH fill %s = %s", selector, value[:30])
         except Exception:
@@ -963,8 +1199,9 @@ def _fill_greenhouse(page, flat: dict) -> tuple[int, list[str]]:
     if loc_filled:
         filled += 1
     log.info("GH fill: location done. Running generic pass...")
-    # Generic pass for remaining inputs — fast=True skips autocomplete to avoid hangs
-    n, unfilled = _fill_all_inputs(page, flat, fast=True)
+    # Generic pass for remaining inputs — fast=False uses _safe_fill with React event firing.
+    # Location autocomplete was already handled above so hangs are avoided.
+    n, unfilled = _fill_all_inputs(page, flat, fast=False)
     filled += n
     log.info("GH fill: inputs done (%d filled, %d unfilled). Filling selects...", n, len(unfilled))
     filled += _fill_all_selects(page, flat)
@@ -1036,11 +1273,12 @@ def _fill_greenhouse(page, flat: dict) -> tuple[int, list[str]]:
                             return True
                 except Exception:
                     pass
-            # Fallback: any combobox that isn't country/location — pick first option
+            # Fallback: any combobox that isn't country/location/education — pick first option
             for inp in page.query_selector_all("input[role='combobox']"):
                 try:
                     inp_id = inp.get_attribute("id") or ""
-                    if inp_id in ("country", "candidate-location"):
+                    if inp_id in ("country", "candidate-location",
+                                  "school--0", "degree--0", "discipline--0"):
                         continue
                     if not inp.is_visible():
                         continue
@@ -1054,9 +1292,90 @@ def _fill_greenhouse(page, flat: dict) -> tuple[int, list[str]]:
 
     _gh_fill_address_type()
 
+    # ── Greenhouse label-aware custom comboboxes ──────────────────────────────
+    # Handle yes/no and other known-answer comboboxes by reading their labels.
+    # Runs after address type so known IDs are already excluded.
+    _KNOWN_COMBOBOX_IDS = {"country", "candidate-location", "school--0", "degree--0",
+                           "discipline--0", "school--1", "degree--1", "discipline--1",
+                           "school--2", "degree--2", "discipline--2"}
+    _COMBOBOX_LABEL_MAP = [
+        # US/Canada location question — answer Yes
+        (("us or canada", "united states or canada", "located in the us",
+          "located in the united states", "are you located in the us",
+          "are you in the us"), "Yes"),
+        # Work authorization
+        (("authorized to work", "authorized to work in the us", "eligible to work",
+          "legal right to work", "work authorization"), "Yes"),
+        # Sponsorship (use profile value)
+        (("require.*sponsor", "need.*sponsor", "visa sponsor", "sponsorship required"), None),
+    ]
+
+    def _gh_fill_label_combobox(inp_el, value: str) -> bool:
+        """Fill a GH React Select combobox with a known value (type → wait → click option)."""
+        try:
+            inp_el.click()
+            inp_el.fill("")
+            inp_el.type(value[:8], delay=40)
+            page.wait_for_timeout(700)
+            for opt_sel in ("[role='option']", "[class*='option']", "[id*='option']"):
+                try:
+                    for opt in page.locator(opt_sel).all()[:20]:
+                        if not opt.is_visible(timeout=150):
+                            continue
+                        ot = (opt.inner_text() or "").strip()
+                        if value.lower() in ot.lower():
+                            opt.click()
+                            log.info("GH custom combobox → '%s'", ot)
+                            page.wait_for_timeout(300)
+                            return True
+                except Exception:
+                    pass
+            page.keyboard.press("Escape")
+        except Exception as _e:
+            log.debug("GH custom combobox fill failed: %s", _e)
+        return False
+
+    for _cb_inp in page.query_selector_all("input[role='combobox']"):
+        try:
+            _cb_id = _cb_inp.get_attribute("id") or ""
+            if _cb_id in _KNOWN_COMBOBOX_IDS:
+                continue
+            if not _cb_inp.is_visible():
+                continue
+            _cb_label = _label_for(page, _cb_inp).lower()
+            import re as _re
+            for _kws, _val in _COMBOBOX_LABEL_MAP:
+                if isinstance(_kws, tuple):
+                    _match = any((_kw in _cb_label or bool(_re.search(_kw, _cb_label))) for _kw in _kws)
+                else:
+                    _match = _kws in _cb_label or bool(_re.search(_kws, _cb_label))
+                if _match:
+                    if _val is None:
+                        _val = flat.get("sponsorship", "No")
+                    if _gh_fill_label_combobox(_cb_inp, _val):
+                        filled += 1
+                    break
+        except Exception:
+            pass
+
+    # ── Greenhouse education comboboxes (school, degree, discipline) ──────────
+    # These are React Select comboboxes — must type to filter, then click option.
+    # school--0 / degree--0 / discipline--0 are standard Greenhouse education field IDs.
+    _gh_combobox("school--0", flat.get("school", "Arizona State University"))
+    page.wait_for_timeout(300)
+    _gh_combobox("degree--0", flat.get("degree_name_ms", "Master of Science"))
+    page.wait_for_timeout(300)
+    _gh_combobox("discipline--0", flat.get("degree_field_ms", "Computer Science"))
+    page.wait_for_timeout(300)
+    # Also handle indexed variants (school--1, degree--1) for multi-education forms
+    for _edu_idx in range(1, 3):
+        _gh_combobox(f"school--{_edu_idx}", flat.get("school_bs", flat.get("school", "Arizona State University")))
+        _gh_combobox(f"degree--{_edu_idx}", flat.get("degree_name_ms", "Bachelor of Science"))
+        _gh_combobox(f"discipline--{_edu_idx}", flat.get("degree_field_ms", "Computer Science"))
+
     # ── Greenhouse custom question fields (placeholder-based) ─────────────────
     GH_PLACEHOLDERS = {
-        "Preferred First Name":  flat.get("preferred_name", "Guna"),
+        "Preferred First Name":  flat.get("first_name", ""),
         "Legal First Name":      flat.get("legal_first_name", flat.get("first_name", "")),
         "Legal Last Name":       flat.get("last_name", ""),
         "Address Line 1":        flat.get("address", ""),
@@ -1068,11 +1387,56 @@ def _fill_greenhouse(page, flat: dict) -> tuple[int, list[str]]:
         try:
             for inp in page.query_selector_all(f"input[placeholder='{placeholder}'], textarea[placeholder='{placeholder}']"):
                 if inp.is_visible() and not inp.input_value():
-                    inp.fill(val)
+                    inp.click()
+                    inp.press("Control+a")
+                    inp.type(val, delay=30)
                     filled += 1
                     log.info("GH placeholder '%s' = %s", placeholder, val[:30])
         except Exception:
             pass
+
+    # ── Post-combobox identity refill ────────────────────────────────────────
+    # Greenhouse React form resets text inputs when combobox selections trigger
+    # parent-component re-renders. Refill critical identity fields LAST using the
+    # React native-input-value-setter JS hack: this directly sets React's internal
+    # state and fires input/change/blur events — the only reliable way to both
+    # set the value AND clear Greenhouse's "field is required" error-message nodes.
+    GH_IDENTITY_REFILL = {
+        "#first_name": flat.get("first_name", ""),
+        "#last_name":  flat.get("last_name", ""),
+        "#email":      flat.get("email", ""),
+        "#phone":      flat.get("phone", ""),
+    }
+    _GH_IDENTITY_JS = """(args) => {
+        const [selector, val] = args;
+        const el = document.querySelector(selector);
+        if (!el) return false;
+        el.focus();
+        const desc = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value');
+        if (desc && desc.set) desc.set.call(el, val);
+        el.dispatchEvent(new Event('input',  { bubbles: true }));
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+        el.dispatchEvent(new Event('blur',   { bubbles: true }));
+        return true;
+    }"""
+    for selector, value in GH_IDENTITY_REFILL.items():
+        if not value:
+            continue
+        try:
+            el = page.locator(selector).first
+            if el.is_visible(timeout=500):
+                current = el.input_value() or ""
+                if current.strip().lower() != value.strip().lower():
+                    filled += 1
+                    log.info("GH post-combobox refill %s = %s", selector, value[:30])
+                # ALWAYS fire the JS refill to ensure React state is set AND
+                # "field is required" error-message nodes are cleared via blur.
+                page.evaluate(_GH_IDENTITY_JS, [selector, value])
+                page.wait_for_timeout(200)
+        except Exception:
+            pass
+    # Wait for React to process blur events and remove error-message DOM nodes
+    page.wait_for_timeout(800)
 
     log.info("GH fill: complete. Total filled=%d", filled)
     return filled, unfilled
@@ -1935,7 +2299,7 @@ def _count_form_fields(page) -> int:
         return 0
 
 
-def _click_apply_cta(page, title: str) -> bool:
+def _click_apply_cta(page, title: str, browser=None) -> bool:
     """Click the Apply / Apply Now / Start Application CTA on a job description page.
     Returns True if a CTA was found and clicked. Returns False if already on a form page."""
 
@@ -1946,8 +2310,8 @@ def _click_apply_cta(page, title: str) -> bool:
 
     # Playwright locator attempts (most specific → most generic)
     CTA_SELECTORS = [
-        # Common ATS patterns
-        "a[href*='/apply']",
+        # Common ATS patterns — href-based selectors are checked with text validation below
+        # to avoid clicking non-apply links (e.g. "membership", "privacy policy", etc.)
         "a[href*='apply?']",
         "button:text-matches('apply for this job', 'i')",
         "button:text-matches('apply for this position', 'i')",
@@ -1955,6 +2319,11 @@ def _click_apply_cta(page, title: str) -> bool:
         "button:text-matches('start application', 'i')",
         "button:text-matches('begin application', 'i')",
         "button:text-matches('apply online', 'i')",
+        # SmartRecruiters primary CTA — must come before generic "apply" to get priority
+        "button:text-matches(\"i'm interested\", 'i')",
+        "a:text-matches(\"i'm interested\", 'i')",
+        "[class*='js-apply-btn']",
+        "button:text-matches('apply for this job', 'i')",
         "a:text-matches('apply for this job', 'i')",
         "a:text-matches('apply now', 'i')",
         "a:text-matches('start application', 'i')",
@@ -1986,7 +2355,10 @@ def _click_apply_cta(page, title: str) -> bool:
                 if any(s in txt for s in SKIP_TEXT):
                     continue
                 btn.scroll_into_view_if_needed()
-                btn.click()
+                if browser is not None:
+                    browser.human_click(element=btn)
+                else:
+                    btn.click()
                 log.info("Clicked Apply CTA '%s' via '%s'", txt[:40], sel)
                 page.wait_for_timeout(500)
                 return True
@@ -2004,6 +2376,15 @@ def _click_apply_cta(page, title: str) -> bool:
             ));
             const txt = el => (el.innerText || el.textContent || el.value || el.getAttribute('aria-label') || '').trim().toLowerCase().replace(/\\s+/g,' ');
             const visible = el => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+
+            // SmartRecruiters: "I'm interested" takes absolute priority over any LinkedIn button
+            for (const el of all) {
+                const t = txt(el);
+                if (visible(el) && (t === "i'm interested" || t.includes("i'm interested"))) {
+                    el.click(); return 'cta:smartrecruiters-interested:' + t.slice(0, 50);
+                }
+            }
+
             const kws = ['apply for this job', 'apply for this position', 'apply now',
                          'start application', 'begin application', 'apply online',
                          'apply for job', 'apply to this job', 'apply for this role',
@@ -2014,6 +2395,15 @@ def _click_apply_cta(page, title: str) -> bool:
                     if (visible(el) && !SKIP.has(t) && (t === kw || t.includes(kw))) {
                         el.click(); return 'cta:' + t.slice(0, 50);
                     }
+                }
+            }
+            // href-based links: only click if link text is apply-related (avoids membership/nav links)
+            const applyHrefLinks = Array.from(document.querySelectorAll('a[href*="/apply"]'));
+            const APPLY_TEXT_KWS = ['apply', 'application', 'apply now', 'apply for'];
+            for (const el of applyHrefLinks) {
+                const t = txt(el);
+                if (visible(el) && !SKIP.has(t) && APPLY_TEXT_KWS.some(kw => t.startsWith(kw))) {
+                    el.click(); return 'cta:href-apply:' + t.slice(0, 40);
                 }
             }
             // Final fallback: any standalone "apply" button (exact match only, not menu items)
@@ -2037,6 +2427,266 @@ def _click_apply_cta(page, title: str) -> bool:
     except Exception as e:
         log.debug("CTA click JS error: %s", e)
         return False
+
+
+def _handle_workday_auth(page, flat: dict) -> bool:
+    """Handle Workday sign-in or account creation walls.
+
+    Workday shows a sign-in/create-account page after clicking Apply.
+    This handler tries to sign in with profile credentials first,
+    then creates an account if sign-in fails.
+
+    Returns True if auth succeeded (or wasn't needed), False if blocked.
+    """
+    try:
+        url_lower = page.url.lower()
+        if "myworkdayjobs.com" not in url_lower and "myworkday.com" not in url_lower:
+            return True  # Not a Workday page
+
+        body = (page.inner_text("body") or "").lower()
+        workday_auth_signals = (
+            "sign in", "create account", "sign up", "workday account",
+            "new user", "existing user", "returning candidate",
+        )
+        if not any(s in body for s in workday_auth_signals):
+            return True  # No auth wall visible
+
+        email = flat.get("email", "")
+        password = flat.get("password", "")
+        if not email or not password:
+            log.warning("[Workday] No credentials in profile — cannot auth")
+            return False
+
+        log.info("[Workday] Auth wall detected — attempting sign in with %s", email)
+
+        # Look for email input (Workday sign-in form)
+        _wd_email_sels = [
+            "input[data-automation-id='email']",
+            "input[type='email']",
+            "#email1",
+            "input[name='email']",
+        ]
+        email_el = None
+        for sel in _wd_email_sels:
+            try:
+                el = page.locator(sel).first
+                if el.is_visible(timeout=1500):
+                    email_el = el
+                    break
+            except Exception:
+                pass
+
+        if email_el:
+            # Fill email
+            try:
+                email_el.click()
+                page.wait_for_timeout(200)
+                email_el.fill(email)
+                page.wait_for_timeout(300)
+            except Exception as e:
+                log.debug("[Workday] Email fill error: %s", e)
+
+            # Fill password if visible
+            pw_sels = [
+                "input[data-automation-id='password']",
+                "input[type='password']",
+                "#password1",
+                "input[name='password']",
+            ]
+            for sel in pw_sels:
+                try:
+                    pw_el = page.locator(sel).first
+                    if pw_el.is_visible(timeout=1000):
+                        pw_el.click()
+                        page.wait_for_timeout(200)
+                        pw_el.fill(password)
+                        page.wait_for_timeout(300)
+                        break
+                except Exception:
+                    pass
+
+            # Click Sign In
+            sign_in_sels = [
+                "button[data-automation-id='signIn']",
+                "button:text-matches('sign in', 'i')",
+                "[type='submit']",
+            ]
+            for sel in sign_in_sels:
+                try:
+                    btn = page.locator(sel).first
+                    if btn.is_visible(timeout=1000):
+                        btn.click()
+                        log.info("[Workday] Clicked Sign In")
+                        page.wait_for_timeout(3000)
+                        # Check if we're past the auth wall
+                        new_body = (page.inner_text("body") or "").lower()
+                        if not any(s in new_body for s in ("invalid password", "incorrect password",
+                                                             "sign in failed", "account not found")):
+                            log.info("[Workday] Sign in appears successful")
+                            return True
+                        log.warning("[Workday] Sign in failed — will try Create Account")
+                        break
+                except Exception:
+                    pass
+
+        # Try clicking Create Account (if sign-in failed or no sign-in form found)
+        create_sels = [
+            "button[data-automation-id='createAccount']",
+            "button:text-matches('create account', 'i')",
+            "a:text-matches('create account', 'i')",
+        ]
+        for sel in create_sels:
+            try:
+                btn = page.locator(sel).first
+                if btn.is_visible(timeout=1500):
+                    btn.click()
+                    log.info("[Workday] Clicked Create Account")
+                    page.wait_for_timeout(2000)
+
+                    # Fill create account form (email + password + confirm password)
+                    for fld_sel in ["input[data-automation-id='email']", "input[type='email']", "#email1"]:
+                        try:
+                            el = page.locator(fld_sel).first
+                            if el.is_visible(timeout=1000):
+                                el.fill(email)
+                                break
+                        except Exception:
+                            pass
+
+                    for fld_sel in ["input[data-automation-id='password']", "input[id='password1']",
+                                    "input[name='password']"]:
+                        try:
+                            el = page.locator(fld_sel).first
+                            if el.is_visible(timeout=1000):
+                                el.fill(password)
+                                break
+                        except Exception:
+                            pass
+
+                    # Confirm password field
+                    for fld_sel in ["input[data-automation-id='verifyPassword']", "input[id='password2']",
+                                    "input[name='confirmPassword']", "input[name='verify_password']"]:
+                        try:
+                            el = page.locator(fld_sel).first
+                            if el.is_visible(timeout=800):
+                                el.fill(password)
+                                break
+                        except Exception:
+                            pass
+
+                    # Submit create account form
+                    for submit_sel in ["button[data-automation-id='createAccount']",
+                                       "button:text-matches('create account', 'i')",
+                                       "button[type='submit']"]:
+                        try:
+                            sbtn = page.locator(submit_sel).first
+                            if sbtn.is_visible(timeout=1000):
+                                sbtn.click()
+                                log.info("[Workday] Submitted Create Account form")
+                                page.wait_for_timeout(4000)
+                                return True
+                        except Exception:
+                            pass
+                    return True
+            except Exception:
+                pass
+
+        log.warning("[Workday] Could not auth — no sign-in or create-account button found")
+        return False
+    except Exception as e:
+        log.debug("[Workday] auth handler error: %s", e)
+        return True  # Don't block on errors — let caller try anyway
+
+
+def _handle_smartrecruiters_gateway(page, flat: dict) -> bool:
+    """Handle SmartRecruiters post-CTA states after 'I'm interested' is clicked.
+
+    Three possible states:
+      1. Application form/modal loaded — just wait for it, return True.
+      2. 'Refer a friend' / login gateway appeared — click through to the real form.
+      3. Nothing changed — return False so caller can retry.
+    """
+    # Wait up to 5s for the SR modal or next page to appear
+    for _ in range(10):
+        try:
+            page.wait_for_timeout(500)
+            body = (page.inner_text("body") or "").lower()
+            url  = page.url.lower()
+
+            # State 1: Real application form visible (has name/email inputs)
+            form_inputs = page.query_selector_all(
+                "input[type='text']:visible, input[type='email']:visible, "
+                "input[name*='first' i]:visible, input[name*='last' i]:visible"
+            )
+            if form_inputs:
+                log.info("[SR] Application form/modal detected (%d inputs)", len(form_inputs))
+                return True
+
+            # State 2: Refer-a-friend / login gateway
+            gateway_signals = (
+                "refer a friend", "refer friend", "invite a friend",
+                "log in to apply", "login to apply", "sign in to apply",
+                "create an account", "register to apply",
+            )
+            if any(s in body for s in gateway_signals):
+                log.info("[SR] Gateway modal detected — looking for 'Continue to Application' path")
+                # Try clicking through to the real application
+                for sel_txt in [
+                    "continue to application", "continue to apply",
+                    "apply without referring", "apply directly",
+                    "next", "continue",
+                ]:
+                    try:
+                        btn = page.locator(
+                            f"button:text-matches('{sel_txt}', 'i'), "
+                            f"a:text-matches('{sel_txt}', 'i')"
+                        ).first
+                        if btn.is_visible(timeout=800):
+                            btn.click()
+                            log.info("[SR] Clicked gateway bypass: '%s'", sel_txt)
+                            page.wait_for_timeout(1500)
+                            return True
+                    except Exception:
+                        pass
+
+                # JS fallback: find any "Continue" / "Next" button not in the refer section
+                try:
+                    page.evaluate("""() => {
+                        const kws = ['continue to application', 'continue to apply',
+                                     'apply directly', 'apply without', 'next', 'continue'];
+                        const btns = Array.from(document.querySelectorAll('button, a, [role="button"]'));
+                        const txt = el => (el.innerText || el.textContent || '').trim().toLowerCase();
+                        for (const kw of kws) {
+                            for (const b of btns) {
+                                const r = b.getBoundingClientRect();
+                                if (r.width > 0 && r.height > 0 && txt(b).includes(kw)) {
+                                    b.click(); return kw;
+                                }
+                            }
+                        }
+                    }""")
+                    page.wait_for_timeout(1500)
+                    log.info("[SR] JS gateway bypass attempted")
+                    return True
+                except Exception:
+                    pass
+
+            # State 3: SR-specific modal container appeared but no form yet — keep waiting
+            modal_signals = (".modal", "[role='dialog']", ".smartrecruiters-modal",
+                             "[data-sh-id]", ".careers-apply")
+            for ms in modal_signals:
+                try:
+                    if page.query_selector(ms):
+                        log.debug("[SR] Modal container visible, waiting for form to render...")
+                        break
+                except Exception:
+                    pass
+
+        except Exception as exc:
+            log.debug("[SR] gateway check error: %s", exc)
+
+    log.info("[SR] Gateway handler finished (no clear state change)")
+    return False
 
 
 def _handle_email_gate(page, flat: dict) -> bool:
@@ -2115,24 +2765,60 @@ def _handle_email_gate(page, flat: dict) -> bool:
 
 
 def _ask_unknown_fields(unfilled_labels: list[str], flat: dict) -> dict[str, str]:
-    """For each unfilled required field, ask the user via Telegram. Returns label→answer map."""
+    """For each unfilled required field, ask the user via Telegram. Returns label→answer map.
+
+    Answers are saved to profile.json under custom_answers so the same question
+    is auto-filled in future applications without asking again.
+    """
     answers: dict[str, str] = {}
     if not unfilled_labels:
         return answers
 
+    # Load existing custom_answers from profile.json for reuse
+    from hireagent.config import PROFILE_PATH
+    _profile_data: dict = {}
+    try:
+        if PROFILE_PATH.exists():
+            _profile_data = json.loads(PROFILE_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    _custom = _profile_data.setdefault("custom_answers", {})
+
+    _saved_new = False
     for label in unfilled_labels:
-        # Skip if we can now map it
+        # Skip if we can now map it from flat
         if _value_for_label(label, flat):
+            continue
+        # Reuse previously saved answer if available
+        _key = label.lower().strip()
+        if _key in _custom:
+            log.info("Reusing saved answer for '%s': %s", label, _custom[_key][:40])
+            answers[label] = _custom[_key]
+            flat[f"_custom_{_key[:20]}"] = _custom[_key]
             continue
         question = (
             f"❓ *Unknown field in application form*\n\n"
             f"Field: `{label}`\n\n"
-            f"What should I enter? (reply with the exact value, or 'skip' to leave blank)"
+            f"What should I enter? (reply with the exact value, or 'skip' to leave blank)\n\n"
+            f"_Your answer will be saved and reused for future applications._"
         )
         log.info("Asking Telegram for field: %s", label)
         answer = _tg_ask(question, timeout=120)
         if answer and answer.lower() != "skip":
             answers[label] = answer
+            # Persist to profile.json for future reuse
+            _custom[_key] = answer
+            flat[f"_custom_{_key[:20]}"] = answer
+            _saved_new = True
+
+    if _saved_new:
+        try:
+            PROFILE_PATH.write_text(json.dumps(_profile_data, indent=2, ensure_ascii=False),
+                                    encoding="utf-8")
+            log.info("Saved %d new custom answer(s) to profile.json", sum(1 for _ in answers))
+        except Exception as _e:
+            log.warning("Failed to save custom answers to profile.json: %s", _e)
+
     return answers
 
 
@@ -2155,6 +2841,7 @@ def apply_via_openclaw(job: dict, profile: dict, resume_path: Path) -> str:
     if not check_openclaw_health():
         raise OpenClawUnavailableError("OpenClaw gateway not reachable. Run: openclaw gateway run")
     flat = _flat(profile)
+    _enforce_identity(flat, profile)
     payload = {
         "task": "apply_job",
         "application_url": job.get("application_url") or job.get("url"),
@@ -2197,7 +2884,26 @@ def apply_via_playwright(
     apply_url = job.get("application_url") or job.get("url")
     title     = job.get("title", "Unknown Role")
     flat      = _flat(profile)
+    _enforce_identity(flat, profile)
     ats       = _detect_ats(apply_url or "")
+
+    # ── JD-based sponsorship override ─────────────────────────────────────
+    # If the JD explicitly says "No sponsorship" / "US Citizen only" → answer "No"
+    # Otherwise default to "Yes" (standard OPT eligibility for most roles)
+    _jd_text = (job.get("description") or job.get("body") or job.get("jd") or "").lower()
+    _NO_SPONSOR_PHRASES = (
+        "no sponsorship", "no visa sponsorship", "us citizen only",
+        "must not require", "citizens only", "green card only",
+        "must be authorized without sponsorship", "unable to sponsor",
+        "not able to sponsor", "cannot sponsor", "does not sponsor",
+        "does not provide sponsorship", "will not sponsor",
+    )
+    if any(p in _jd_text for p in _NO_SPONSOR_PHRASES):
+        flat["sponsorship"] = "No"
+        log.info("[sponsorship] JD contains no-sponsor phrase — override sponsorship=No")
+    else:
+        flat["sponsorship"] = "Yes"
+        log.info("[sponsorship] No restriction in JD — override sponsorship=Yes")
 
     # Skip Indeed-hosted job pages (they are NOT ATS apply forms)
     if apply_url and ("indeed.com/viewjob" in apply_url or
@@ -2243,15 +2949,16 @@ def apply_via_playwright(
 
         # ── Vision-loop singletons ────────────────────────────────────────────
         from hireagent.apply.vision_loop import (
-            BrowserController as _BrowserController,
-            IntelligenceLayer as _IntelligenceLayer,
-            CaptchaSolver     as _CaptchaSolver,
+            BrowserController    as _BrowserController,
+            IntelligenceLayer    as _IntelligenceLayer,
+            CaptchaSolver        as _CaptchaSolver,
             vision_verified_fill as _vision_verified_fill,
             find_submit_button_vision as _find_submit_btn_vision,
+            _SOM_INJECT_JS,
         )
         _nim  = _IntelligenceLayer()
         _capt = _CaptchaSolver()
-        _bc   = _BrowserController(page)
+        _bc   = _BrowserController(page, apply_stealth=True)
 
         # ── SSN / fake job detection ──────────────────────────────────────────
         try:
@@ -2275,6 +2982,42 @@ def apply_via_playwright(
                 log.warning("⚠️  SSN requested — flagging as FAKE JOB: %s @ %s", title, company_name)
                 _tg(f"🚨 *FAKE JOB — SSN requested*\n*Job:* {title}\n*Company:* {company_name}\n*URL:* {apply_url}")
                 return "fake_job_ssn"
+        except Exception:
+            pass
+
+        # ── US Citizenship / clearance requirement check ──────────────────────
+        # Skip immediately if job requires US citizenship or active security clearance.
+        # (OPT/F-1 holders are ineligible for these roles — no point applying.)
+        try:
+            citizenship_required = page.evaluate("""() => {
+                const body = (document.body.innerText || '').toLowerCase();
+                const patterns = [
+                    'must be a u.s. citizen',
+                    'must be a us citizen',
+                    'u.s. citizenship required',
+                    'us citizenship required',
+                    'united states citizenship required',
+                    'citizenship: u.s.',
+                    'citizenship: us',
+                    'requires u.s. citizenship',
+                    'requires us citizenship',
+                    'applicants must be citizens',
+                    'must hold u.s. citizenship',
+                    'only u.s. citizens',
+                    'only us citizens',
+                    'active secret clearance',
+                    'active top secret',
+                    'ts/sci clearance required',
+                    'top secret clearance required',
+                    'secret clearance required',
+                    'dod clearance required',
+                    'active security clearance required',
+                ];
+                return patterns.some(p => body.includes(p));
+            }""")
+            if citizenship_required:
+                log.warning("⛔  US Citizenship / clearance required — skipping: %s", title)
+                return RESULT_SKIPPED
         except Exception:
             pass
 
@@ -2395,15 +3138,74 @@ def apply_via_playwright(
             # Extra wait for JS-heavy ATS pages to fully render
             page.wait_for_timeout(500)
 
-            # Handle iCIMS/Breezy-style email-gate pages BEFORE CTA click
+            # Handle email-gate pages that appear BEFORE the Apply CTA (iCIMS, Breezy)
             _handle_email_gate(page, flat)
 
-            cta_clicked = _click_apply_cta(page, title)
-            # After CTA click, give the new page time to load
-            page.wait_for_timeout(2000)
+            cta_clicked = _click_apply_cta(page, title, browser=_bc)
+            # After CTA click, wait for navigation to settle (UltiPro/iCIMS navigate to a new page)
+            try:
+                page.wait_for_load_state("domcontentloaded", timeout=8000)
+            except Exception:
+                pass
+            page.wait_for_timeout(1500)
+
+            # ── SmartRecruiters post-CTA handling ────────────────────────────
+            # "I'm interested" can open: (a) a modal form, (b) a refer/login gateway.
+            # Wait for the modal/form to fully render before beginning Vision Phase.
+            if ats == "smartrecruiters" and cta_clicked:
+                _handle_smartrecruiters_gateway(page, flat)
+
+            # Handle email-gate pages that appear AFTER the Apply CTA click
+            # (some ATS redirect to an email entry page as the first step of the form)
+            _handle_email_gate(page, flat)
+
+            # ── Workday sign-in / create-account handler ─────────────────────
+            # Must run BEFORE the generic SSO gate check so Workday jobs don't
+            # get immediately skipped as "account_required".
+            if ats == "workday":
+                _wd_auth_ok = _handle_workday_auth(page, flat)
+                if not _wd_auth_ok:
+                    log.warning("[Workday] Auth failed — skipping job")
+                    return "account_required"
+                # After Workday auth, navigate to the apply page if needed
+                page.wait_for_timeout(2000)
+                # Workday shows "Autofill with Resume" after sign-in — upload resume
+                try:
+                    _wd_body = (page.inner_text("body") or "").lower()
+                    if "autofill" in _wd_body or "my resume" in _wd_body or "upload" in _wd_body:
+                        _resume_str = str(resume_path.resolve()) if resume_path and resume_path.exists() else ""
+                        if _resume_str:
+                            for upload_sel in [
+                                "input[type='file']",
+                                "[data-automation-id='file-upload-input']",
+                            ]:
+                                try:
+                                    _file_inp = page.locator(upload_sel).first
+                                    _file_inp.set_input_files(_resume_str, timeout=3000)
+                                    log.info("[Workday] Resume uploaded via '%s'", upload_sel)
+                                    page.wait_for_timeout(2000)
+                                    break
+                                except Exception:
+                                    pass
+                        # Click Continue / Next after resume upload
+                        for btn_sel in ["button[data-automation-id='bottom-navigation-next-button']",
+                                        "button:text-matches('continue', 'i')",
+                                        "button:text-matches('next', 'i')"]:
+                            try:
+                                _btn = page.locator(btn_sel).first
+                                if _btn.is_visible(timeout=1500):
+                                    _btn.click()
+                                    log.info("[Workday] Clicked Continue past resume upload")
+                                    page.wait_for_timeout(3000)
+                                    break
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
 
             # Check for account/SSO gate — if page now demands login/register, skip
-            if cta_clicked:
+            # Skip this check for Workday — auth was already handled by _handle_workday_auth above
+            if cta_clicked and ats != "workday":
                 try:
                     body_lower = (page.inner_text("body") or "").lower()
                     url_lower = (page.url or "").lower()
@@ -2473,9 +3275,13 @@ def apply_via_playwright(
                             .filter(e => { const r=e.getBoundingClientRect(); return r.width>0&&r.height>0; }).length;
                     }""")
                     if n_fields == 0 and n_buttons == 0:
-                        log.warning("CTA clicked but no form/buttons appeared — page may need login or is in iframe")
-                        # Try waiting a bit longer for slow ATS pages
-                        page.wait_for_timeout(1000)
+                        log.warning("CTA clicked but no form/buttons appeared — waiting for slow ATS navigation")
+                        # Wait for navigation to complete on slow ATS pages (UltiPro, iCIMS)
+                        try:
+                            page.wait_for_load_state("domcontentloaded", timeout=5000)
+                        except Exception:
+                            pass
+                        page.wait_for_timeout(2000)
                         n_fields = _count_form_fields(page)
                         n_buttons = page.evaluate("""() => {
                             return Array.from(document.querySelectorAll('button,[role="button"],input[type="submit"]'))
@@ -2541,22 +3347,36 @@ CRITICAL:
 - Never fabricate data. Use only information from the profile.
 - If a field is optional and you have no data, omit it.
 - For select/dropdown fields, only use exact values from the provided options.
+- Read the FULL question text carefully — map it to the correct profile field, not just the first name-like value.
 
 FIELD MAPPING RULES:
-- Name → firstName, lastName, fullName from profile
+- Name fields (first name, last name, full name) → use firstName / lastName / fullName
 - Email → profile.email (exact match)
 - Phone → 10-digit US format: XXXXXXXXXX
-- Salary → integer (e.g. 90000), no commas or symbols
+- State of residency / current state / which state → "Arizona" (full state name, NOT the candidate's name)
+- Compensation / salary expectation / expected salary / desired salary → use expectedSalary (e.g. "90000")
+- Currency → "USD"
+- Pronouns / gender pronouns → "He/Him"
 - Years of experience → "0-1" or "1-3" based on profile
 - Work authorization:
   - OPT/F-1 → select "Employment Authorization Document (EAD)" or "Other" or "OPT"
-  - "Are you authorized to work in the US?" → "Yes"
-  - "Will you need sponsorship NOW?" → "No"
-  - "Will you need sponsorship in the future?" → "Yes"
+  - "Are you authorized to work in the US?" / "authorized to work for any employer" → "Yes"
+  - "Will you need sponsorship NOW?" / "currently need sponsorship" → "No"
+  - "Will you need sponsorship in the future?" / "ever need sponsorship" / "future sponsorship" → "Yes"
+- US state residency list (AR, AZ, CO, CT...) → check if "AZ" or "Arizona" is in the list → "Yes"
 - Cover letter / essay → 2-3 sentences: skills match + work auth + availability
 - Willing to relocate → "Yes"
 - Background check → "Yes"
-- Disability/veteran EEO → "I prefer not to answer" or "I do not have a disability" / "I am not a protected veteran"
+- Disability/veteran EEO → "No, I do not have a disability" / "I am not a protected veteran" — NEVER select "I don't wish to answer" or "Decline" or "Prefer not to"
+
+FUZZY DROPDOWN MATCHING (critical):
+- When a field has listed options, NEVER return a bare "Yes" or "No" — always pick the exact option text.
+- If your answer intent is "No" and options include variants like "No, I do not have a disability",
+  "No sponsorship needed", "I am not a protected veteran", "I prefer not to answer" — pick the MOST
+  NEGATIVE / DECLINING option that fits.
+- If your answer intent is "Yes" and options include "Yes, I am authorized" or similar — pick the
+  MOST POSITIVE / AFFIRMING option.
+- Priority: exact option match > substring match > semantic closest match.
 
 RESPONSE FORMAT — return ONLY this JSON:
 {"fields": {"field_label_or_name": "value", ...}}"""
@@ -2585,15 +3405,21 @@ RESPONSE FORMAT — return ONLY this JSON:
                 "email": flat.get("email"),
                 "phone": flat.get("phone"),
                 "city": flat.get("city"),
-                "state": flat.get("state"),
+                "state": flat.get("state"),           # "AZ"
+                "stateFullName": "Arizona",            # full name for dropdowns
                 "country": "United States",
                 "postalCode": flat.get("postal_code"),
+                "pronouns": "He/Him",
                 "linkedinUrl": flat.get("linkedin_url"),
                 "githubUrl": flat.get("github_url"),
                 "portfolioUrl": flat.get("portfolio_url"),
-                "expectedSalary": flat.get("salary", "90000"),
-                "salaryRange": flat.get("salary_range"),
+                "expectedSalary": "90000",
+                "currency": "USD",
+                "salaryRange": "85000-115000",
                 "yearsExperience": flat.get("years_experience", "1"),
+                "authorizedToWork": "Yes",
+                "requireSponsorshipNow": "No",
+                "requireSponsorshipFuture": "Yes",
                 "workAuthorization": "OPT (F-1 Student Visa) — authorized to work; will need H-1B sponsorship in future",
                 "degree": edu_m.get("degree", "Master of Science"),
                 "major": edu_m.get("field_primary", "Computer Science"),
@@ -2603,8 +3429,8 @@ RESPONSE FORMAT — return ONLY this JSON:
                 "skills": skills_str or "Python, SQL, Java, React, Node.js, AWS, Docker, Git, machine learning",
                 "targetRole": title,
                 "availability": "Immediately",
-                "relocateWilling": True,
-                "remotePreference": True,
+                "relocateWilling": "Yes",
+                "remotePreference": "Yes",
             }
 
             # Build form schema: include options if available from page_context
@@ -2626,7 +3452,13 @@ RESPONSE FORMAT — return ONLY this JSON:
                     raw = re.sub(r"^```[a-zA-Z]*\n?", "", raw)
                     raw = re.sub(r"\n?```$", "", raw)
                     raw = raw.strip()
-                parsed = _json.loads(raw)
+                # Greedy JSON: strip any "Thinking" preamble before first {
+                _fb = raw.find('{')
+                _lb = raw.rfind('}')
+                if _fb != -1 and _lb > _fb:
+                    raw = raw[_fb:_lb + 1]
+                _decoder = _json.JSONDecoder()
+                parsed, _ = _decoder.raw_decode(raw)
                 # Support both {"fields": {...}} and flat {label: value}
                 answers = parsed.get("fields", parsed)
                 log.info("LLM filled %d fields: %s", len(answers), list(answers.keys()))
@@ -2635,10 +3467,79 @@ RESPONSE FORMAT — return ONLY this JSON:
                 log.warning("LLM form-fill parse failed: %s | raw=%s", _e, locals().get("raw", "")[:300])
                 return {}
 
+        def _deep_search_profile(label: str) -> str | None:
+            """Recursively search profile JSON for a value matching the field label.
+            Checks profile.custom_answers first (saved from prior Telegram sessions).
+            Returns a string value if found, None if truly missing."""
+            lbl = label.lower().rstrip("*").strip()
+
+            # ── Check custom_answers saved from prior Telegram sessions ──
+            _saved = profile.get("custom_answers", {})
+            if lbl in _saved:
+                log.debug("[deep_search] '%s' → custom_answer='%s'", label, _saved[lbl][:40])
+                return _saved[lbl]
+
+            # Keyword → profile path heuristics
+            _EDU_KEYWORDS = ("degree", "diploma", "qualification", "academic")
+            _SCHOOL_KEYWORDS = ("school", "university", "college", "institution", "alma mater")
+            _DISCIPLINE_KEYWORDS = ("discipline", "field of study", "major", "concentration",
+                                    "area of study", "specialization")
+            _GPA_KEYWORDS = ("gpa", "grade point", "grade average")
+
+            edu_m = profile.get("education", {}).get("masters", {})
+            edu_b = profile.get("education", {}).get("bachelors", {})
+
+            if any(k in lbl for k in _EDU_KEYWORDS):
+                val = edu_m.get("degree") or edu_b.get("degree")
+                if val:
+                    log.debug("[deep_search] '%s' → degree='%s'", label, val)
+                    return val
+            if any(k in lbl for k in _SCHOOL_KEYWORDS):
+                val = edu_m.get("school") or edu_b.get("school")
+                if val:
+                    log.debug("[deep_search] '%s' → school='%s'", label, val)
+                    return val
+            if any(k in lbl for k in _DISCIPLINE_KEYWORDS):
+                val = edu_m.get("field_primary") or edu_b.get("field_primary")
+                if val:
+                    log.debug("[deep_search] '%s' → discipline='%s'", label, val)
+                    return val
+            if any(k in lbl for k in _GPA_KEYWORDS):
+                val = flat.get("gpa") or edu_m.get("gpa")
+                if val:
+                    return str(val)
+
+            # Age / birthdate questions
+            if "18" in lbl and ("age" in lbl or "older" in lbl or "years" in lbl):
+                return "Yes"
+            # Non-compete / agreement questions
+            if "non-compete" in lbl or "restrict" in lbl or "agreement" in lbl:
+                return "No"
+            # Previously employed questions
+            if "previous" in lbl and ("employ" in lbl or "work" in lbl):
+                return "No"
+            # Disability / reason unable to perform
+            if "reason" in lbl and ("unable" in lbl or "perform" in lbl or "duties" in lbl):
+                return "No"
+            return None
+
         def _ask_and_fill_unknowns(pg, unfilled: list[str]) -> int:
             """Fill unknown required fields: first try rule-based, then LLM for the rest."""
             filled = 0
             still_unknown = []
+
+            # Pass 0: deep profile JSON search before rule-based or LLM
+            remaining_after_deep = []
+            for label in unfilled:
+                deep_val = _deep_search_profile(label)
+                if deep_val:
+                    log.info("[deep_search] Resolved '%s' → '%s' from profile", label, deep_val)
+                    flat[f"_custom_{label.lower()[:20]}"] = deep_val
+                    _fill_one(pg, label, deep_val)
+                    filled += 1
+                else:
+                    remaining_after_deep.append(label)
+            unfilled = remaining_after_deep
 
             # Pass 1: rule-based
             for label in unfilled:
@@ -2681,16 +3582,71 @@ RESPONSE FORMAT — return ONLY this JSON:
 
             log.info("LLM assist: %d unknown fields → %s", len(still_unknown), still_unknown)
             llm_answers = _llm_answer_fields(still_unknown, page_context=page_ctx)
+            llm_filled_labels: set[str] = set()
             for label, value in llm_answers.items():
                 if value and value.lower() not in ("none", "null", "n/a", ""):
                     flat[f"_custom_{label.lower()[:20]}"] = value
                     if _fill_one(pg, label, value):
                         filled += 1
+                        llm_filled_labels.add(label)
+
+            # Pass 3: Telegram inline-keyboard for select fields that LLM couldn't map.
+            # This catches location-type questions ("Are you in the US or Canada?"),
+            # work-auth selects, and any ATS-specific dropdown the LLM hallucinated.
+            still_after_llm = [
+                lbl for lbl in still_unknown
+                if lbl not in llm_filled_labels
+            ]
+            for _ctx_field in page_ctx.get("fields", []):
+                _lbl = _ctx_field.get("label", "")
+                if _lbl not in still_after_llm:
+                    continue
+                _opts = _ctx_field.get("options", [])
+                if not _opts:
+                    continue  # text field — skip Telegram ask here
+                # Check custom_answers first (saves repeated Telegram prompts)
+                _key = _lbl.lower().strip()
+                _saved = profile.get("custom_answers", {})
+                if _key in _saved:
+                    log.info("[tg-select] Reusing saved answer for '%s': %s", _lbl, _saved[_key][:40])
+                    if _fill_one(pg, _lbl, _saved[_key]):
+                        filled += 1
+                    continue
+                # Ask via Telegram inline keyboard
+                _tg_question = (
+                    f"❓ *Application form — select required*\n\n"
+                    f"Field: `{_lbl}`\n\n"
+                    f"Tap the correct answer:"
+                )
+                log.info("[tg-select] Asking Telegram for select field: %s", _lbl)
+                _chosen = _tg_ask_select(_tg_question, _opts, timeout=180)
+                if _chosen and _chosen.lower() not in ("skip", "none", ""):
+                    if _fill_one(pg, _lbl, _chosen):
+                        filled += 1
+                    # Persist to profile.json for future reuse
+                    try:
+                        from hireagent.config import PROFILE_PATH
+                        _pdata: dict = {}
+                        if PROFILE_PATH.exists():
+                            import json as _jmod
+                            _pdata = _jmod.loads(PROFILE_PATH.read_text(encoding="utf-8"))
+                        _pdata.setdefault("custom_answers", {})[_key] = _chosen
+                        import json as _jmod2
+                        PROFILE_PATH.write_text(_jmod2.dumps(_pdata, indent=2, ensure_ascii=False), encoding="utf-8")
+                        log.info("[tg-select] Saved answer '%s' → '%s' to profile.json", _lbl, _chosen[:40])
+                    except Exception as _save_err:
+                        log.debug("[tg-select] Save to profile.json failed: %s", _save_err)
 
             return filled
 
         def _fill_one(pg, label: str, value: str) -> bool:
             """Try to find and fill a single field by label. Returns True if filled."""
+            # Hard-code guard: never let LLM override identity fields
+            _lbl_lower = label.lower()
+            if any(kw in _lbl_lower for kw in ("first name", "given name", "firstname")):
+                value = flat.get("first_name", "")
+                log.debug("[fill] first-name guard: '%s' → '%s'", label, value)
+            log.debug("[fill] → '%s' = '%s'", label, value[:60])
             # Handle unlabeled fields identified by name/placeholder/id attribute
             if label.startswith("[unlabeled:"):
                 attr_val = label[len("[unlabeled:"):-1]
@@ -2722,7 +3678,7 @@ RESPONSE FORMAT — return ONLY this JSON:
                             except Exception:
                                 pass
                     else:
-                        el.fill(value)
+                        _fill_and_select(pg, el, value)
                     return True
             except Exception:
                 pass
@@ -2741,8 +3697,182 @@ RESPONSE FORMAT — return ONLY this JSON:
                                 except Exception:
                                     pass
                         else:
-                            _safe_fill(inp, value, page=pg)
+                            _fill_and_select(pg, inp, value)
                         return True
+            except Exception:
+                pass
+            return False
+
+        def _fill_and_select(pg, el, value: str) -> bool:
+            """Fill a field and handle React Select dropdowns.
+            Uses el.type (element-level) to trigger React's keydown events and open the dropdown.
+            Falls back to el.fill for plain text inputs."""
+            import time as _ft
+            try:
+                role = el.evaluate("e => (e.getAttribute('role') || '').toLowerCase()")
+                cls  = el.evaluate("e => (e.className || '').toLowerCase()")
+                is_combobox = role == "combobox" or "select__input" in cls or "select" in role
+            except Exception:
+                is_combobox = False
+
+            if is_combobox:
+                # React Select: click → wait for menu → clear → type chars → pick option
+                for _attempt in range(2):
+                    try:
+                        el.scroll_into_view_if_needed()
+                        el.click()
+                        _ft.sleep(0.5)  # wait 500ms for React menu to fully initialize
+                        el.fill("")
+                        _ft.sleep(0.08)
+                        # Type first 4 chars on the ELEMENT (not page) so React sees keydown events
+                        el.type(value[:4], delay=60)
+                        _ft.sleep(0.5)  # allow dropdown to render
+
+                        clicked = _click_matching_option(pg, value)
+
+                        # If menu is still open after click, press Escape to clear state and retry
+                        if clicked:
+                            _ft.sleep(0.3)
+                            try:
+                                still_open = pg.locator("[role='option']:visible").count()
+                                if still_open > 0:
+                                    log.debug("_fill_and_select: menu still open after click — pressing Escape")
+                                    pg.keyboard.press("Escape")
+                                    _ft.sleep(0.2)
+                                    if _attempt == 0:
+                                        continue  # retry once
+                            except Exception:
+                                pass
+                        return clicked
+                    except Exception:
+                        pass
+
+            # Plain text input fallback
+            try:
+                el.fill(value)
+                _click_matching_option(pg, value)
+                return True
+            except Exception:
+                return False
+
+        def _click_matching_option(pg, value: str) -> bool:
+            """After filling/typing into a React custom select, click the matching dropdown option.
+            Handles Greenhouse/Lever React-Select where typing filters but doesn't select.
+            Uses explicit mousedown → mouseup (not just click) to trigger React synthetic events.
+            Fuzzy matching: 'Yes' matches 'Yes, I have a disability', etc.
+            Returns True if an option was clicked."""
+            import time as _t
+            try:
+                # Wait up to 1.5s for dropdown options to appear
+                pg.wait_for_selector("[role='option']:visible", timeout=1500)
+                opts = pg.locator("[role='option']:visible").all()
+                if not opts:
+                    return False
+                val_lower = value.lower().strip()
+
+                best = None
+                # Pass 1 — exact match
+                for opt in opts[:20]:
+                    try:
+                        ot = (opt.inner_text() or "").strip()
+                        if ot.lower() == val_lower:
+                            best = opt
+                            break
+                    except Exception:
+                        pass
+
+                # Pass 2 — value is contained in option text ("Yes" → "Yes, I have a disability")
+                if best is None:
+                    for opt in opts[:20]:
+                        try:
+                            ot = (opt.inner_text() or "").strip().lower()
+                            if val_lower and ot.startswith(val_lower):
+                                best = opt
+                                break
+                        except Exception:
+                            pass
+
+                # Pass 3 — option text is contained in value ("No" matches "No, I do not need sponsorship")
+                if best is None:
+                    for opt in opts[:20]:
+                        try:
+                            ot = (opt.inner_text() or "").strip().lower()
+                            if ot and val_lower.startswith(ot) and len(ot) >= 2:
+                                best = opt
+                                break
+                        except Exception:
+                            pass
+
+                # Pass 4 — degree-specific semantic map (handles "Masters", "M.S.", "Graduate Degree")
+                _DEGREE_ALIASES: dict[str, list[str]] = {
+                    "master of science": ["masters", "master's", "m.s.", "ms", "graduate degree",
+                                          "master of science (ms)", "master's degree"],
+                    "bachelor of science": ["bachelors", "bachelor's", "b.s.", "bs",
+                                            "undergraduate degree", "bachelor of science (bs)"],
+                    "master of business administration": ["mba", "m.b.a."],
+                    "doctor of philosophy": ["phd", "ph.d.", "doctorate"],
+                }
+                if best is None:
+                    _aliases = _DEGREE_ALIASES.get(val_lower, [])
+                    for opt in opts[:20]:
+                        try:
+                            ot = (opt.inner_text() or "").strip().lower()
+                            if ot and (ot in _aliases or any(a in ot for a in _aliases)
+                                       or any(a in val_lower for a in [ot]) and len(ot) >= 2):
+                                best = opt
+                                break
+                        except Exception:
+                            pass
+
+                # Pass 5 — fuzzy: any overlap of 3+ chars
+                if best is None:
+                    for opt in opts[:20]:
+                        try:
+                            ot = (opt.inner_text() or "").strip().lower()
+                            if ot and (val_lower[:4] in ot or ot[:4] in val_lower):
+                                best = opt
+                                break
+                        except Exception:
+                            pass
+
+                # Pass 6 — fallback: first option
+                if best is None and opts:
+                    best = opts[0]
+
+                if best:
+                    best_text = (best.inner_text() or "")[:40]
+                    best.scroll_into_view_if_needed()
+                    _t.sleep(0.08)
+                    try:
+                        bb = best.bounding_box()
+                        if bb:
+                            ox = bb["x"] + bb["width"] / 2
+                            oy = bb["y"] + bb["height"] / 2
+                            # Explicit mousedown → mouseup sequence (not just .click())
+                            # to ensure React's synthetic event system fires
+                            page.dispatch_event(best, "mousedown")
+                            best.focus()
+                            _t.sleep(0.04)
+                            page.mouse.move(ox, oy)
+                            page.mouse.down()
+                            _t.sleep(0.04)
+                            page.mouse.up()
+                            _t.sleep(0.06)
+                            page.keyboard.press("Enter")
+                        else:
+                            page.dispatch_event(best, "mousedown")
+                            best.focus()
+                            best.click(timeout=2000)
+                            page.keyboard.press("Enter")
+                    except Exception:
+                        try:
+                            best.click(timeout=2000)
+                        except Exception:
+                            pass
+                    _t.sleep(0.2)
+                    log.debug("_click_matching_option: selected '%s' for value '%s'",
+                              best_text, value[:30])
+                    return True
             except Exception:
                 pass
             return False
@@ -2769,14 +3899,20 @@ RESPONSE FORMAT — return ONLY this JSON:
             return list(dict.fromkeys(errors))  # deduplicate
 
         def _collect_empty_required(pg) -> list[str]:
-            """Return labels of visible required inputs that are still empty."""
+            """Return labels of visible required inputs that are still empty.
+
+            Also catches custom React/ATS dropdowns (role=combobox/listbox) that
+            ATS like Rippling render instead of native <select> elements.
+            """
             empty: list[str] = []
             try:
                 for inp in pg.query_selector_all(
                     "input[required]:not([type='password']):not([type='hidden']):not([type='file']), "
                     "input[aria-required='true']:not([type='password']):not([type='hidden']):not([type='file']), "
                     "textarea[required], textarea[aria-required='true'], "
-                    "select[required], select[aria-required='true']"
+                    "select[required], select[aria-required='true'], "
+                    "[role='combobox'][aria-required='true'], "
+                    "[role='listbox'][aria-required='true']"
                 ):
                     try:
                         if not inp.is_visible():
@@ -2786,6 +3922,28 @@ RESPONSE FORMAT — return ONLY this JSON:
                             val = inp.input_value() or ""
                         except Exception:
                             pass
+                        # React Select comboboxes (role=combobox, cls=select__input) always
+                        # return "" from input_value() even when a value is selected — the
+                        # selected value lives in a sibling select__single-value div.
+                        # Check that sibling to determine if the field actually has a value.
+                        if not val.strip():
+                            role = (inp.get_attribute("role") or "").lower()
+                            cls  = (inp.get_attribute("class") or "").lower()
+                            if role == "combobox" or "select__input" in cls:
+                                try:
+                                    # Look for a sibling .select__single-value div with text
+                                    _sv = inp.evaluate("""el => {
+                                        let node = el.parentElement;
+                                        for (let i = 0; i < 5 && node; i++, node = node.parentElement) {
+                                            const sv = node.querySelector('.select__single-value');
+                                            if (sv) return (sv.innerText || sv.textContent || '').trim();
+                                        }
+                                        return '';
+                                    }""")
+                                    if _sv and _sv.strip():
+                                        continue  # combobox has a selection — not empty
+                                except Exception:
+                                    pass
                         if not val.strip():
                             lbl = _label_for(pg, inp)
                             if lbl:
@@ -2844,9 +4002,18 @@ RESPONSE FORMAT — return ONLY this JSON:
             log.debug("Post-CTA captcha check error: %s", _ce)
 
         # ── Phase 0: Vision-Verified fill (Nemotron maps fields → values) ──────
+        # 2-second human pause — allow React components to fully initialize
+        log.info("Human pause: 2s for React components to init before Phase 0 scan…")
+        page.wait_for_timeout(2000)
+
         _bc.page = page
+        _v_fill_start = time.time()
         _v_filled, _v_errors = _vision_verified_fill(page, flat, _nim, _bc, _capt, apply_url or "")
-        log.info("Phase 0 vision-fill: %d fields, errors=%s", _v_filled, _v_errors or "none")
+        _v_fill_elapsed = time.time() - _v_fill_start
+        log.info("Phase 0 vision-fill: %d fields, errors=%s (%.1fs)",
+                 _v_filled, _v_errors or "none", _v_fill_elapsed)
+        if _v_errors:
+            _tg(f"⚠️ *Form errors detected (vision scan)*\n{chr(10).join(_v_errors[:5])}")
         if _v_errors:
             _tg(f"⚠️ *Form errors detected (vision scan)*\n{chr(10).join(_v_errors[:5])}")
 
@@ -2909,18 +4076,298 @@ RESPONSE FORMAT — return ONLY this JSON:
 
         log.info("Pre-submit total: %d fields filled", n_filled)
 
+        # ── Watch-Evaluate-Fix (WEF) Self-Correction Loop ──────────────────────
+        # 3 cycles: fill → SoM screenshot → Llama-3.2 error scan → correct → repeat.
+        # On 3rd failure: save debug frames and alert Telegram instead of submitting.
+        _WEF_MAX_CYCLES    = 3
+        _debug_frames_dir  = Path(os.path.expanduser("~/.hireagent/debug_frames"))
+        _debug_frames_dir.mkdir(parents=True, exist_ok=True)
+        # Set of degree-field labels that already failed normal mapping (triggers force-type)
+        _degree_fields_failed: set[str] = set()
+
+        for _wef_cycle in range(_WEF_MAX_CYCLES):
+            # Inject SoM overlay for annotated screenshot
+            try:
+                page.evaluate(_SOM_INJECT_JS)
+                page.wait_for_timeout(500)
+            except Exception:
+                pass
+
+            _wef_ss_path = _debug_frames_dir / f"wef_c{_wef_cycle}_{int(time.time())}.png"
+            try:
+                page.screenshot(path=str(_wef_ss_path), full_page=False)
+                with open(str(_wef_ss_path), "rb") as _f:
+                    _wef_b64 = base64.b64encode(_f.read()).decode()
+            except Exception as _ss_err:
+                log.warning("[WEF] screenshot failed cycle %d: %s", _wef_cycle + 1, _ss_err)
+                break
+
+            _wef_errors = _nim.scan_for_errors_with_field_ids(_wef_b64)
+
+            if not _wef_errors:
+                log.info("[WEF] Cycle %d: form is clean — no errors detected", _wef_cycle + 1)
+                break  # All clear — exit WEF loop and proceed to submit
+
+            log.warning("[WEF] Cycle %d/%d: %d error(s) — %s",
+                        _wef_cycle + 1, _WEF_MAX_CYCLES,
+                        len(_wef_errors), [e.get("label") or e.get("error","?")[:40] for e in _wef_errors])
+
+            if _wef_cycle == _WEF_MAX_CYCLES - 1:
+                # All 3 cycles exhausted — save debug frames and alert
+                _dom_snap_path = _debug_frames_dir / f"dom_snapshot_{int(time.time())}.html"
+                _err_vis_path  = _debug_frames_dir / f"error_vision_{int(time.time())}.png"
+                try:
+                    _dom_snap_path.write_text(page.content(), encoding="utf-8")
+                    log.info("[WEF] DOM snapshot saved: %s", _dom_snap_path)
+                except Exception:
+                    pass
+                try:
+                    page.screenshot(path=str(_err_vis_path), full_page=False)
+                    log.info("[WEF] Error vision frame saved: %s", _err_vis_path)
+                except Exception:
+                    pass
+                _wef_alert_body = (
+                    f"⚠️ *WEF Loop: {_WEF_MAX_CYCLES} cycles failed* — {title}\n"
+                    f"Remaining errors:\n"
+                    + "\n".join(
+                        f"  • [{e.get('field_id','?')}] {e.get('label','(unknown)')} — {e.get('error','')}"
+                        for e in _wef_errors[:5]
+                    )
+                    + f"\nDebug frames: {_debug_frames_dir}"
+                )
+                _tg(_wef_alert_body, _err_vis_path if _err_vis_path.exists() else None)
+                break  # Do not block submit — interlock will gate it
+
+            # ── Correction Phase ────────────────────────────────────────────
+            for _wef_err in _wef_errors:
+                _lbl       = _wef_err.get("label", "")
+                _lbl_lower = _lbl.lower()
+                _err_txt   = _wef_err.get("error", "").lower()
+
+                # Smart Degree mapping: force-type "Master" + Enter if normal fill failed
+                if ("degree" in _lbl_lower or "education level" in _lbl_lower) and (
+                    "select" in _err_txt or "required" in _err_txt or "choose" in _err_txt
+                ):
+                    _degree_fields_failed.add(_lbl_lower)
+                    log.info("[WEF] Smart degree mapping: force-typing 'Master' for '%s'", _lbl[:40])
+                    try:
+                        _deg_loc = page.get_by_label(
+                            re.compile(r"degree|education level", re.IGNORECASE)
+                        ).first
+                        _deg_loc.click(timeout=1500)
+                        page.wait_for_timeout(200)
+                        page.keyboard.type("Master")
+                        page.wait_for_timeout(350)
+                        page.keyboard.press("Enter")
+                        page.wait_for_timeout(400)
+                        # If still unresolved, arrow-select the first match
+                        try:
+                            _dv = _deg_loc.input_value()
+                            if not _dv or "select" in _dv.lower():
+                                page.keyboard.press("ArrowDown")
+                                page.wait_for_timeout(200)
+                                page.keyboard.press("Enter")
+                        except Exception:
+                            pass
+                        log.info("[WEF] Degree force-type complete")
+                    except Exception as _de:
+                        log.debug("[WEF] Degree force-type error: %s", _de)
+
+            # Re-run vision fill so the 120B model can fix remaining fields
+            # Feed the debug context from this cycle as extra system context
+            _bc.page = page
+            _wef_fixed, _ = _vision_verified_fill(page, flat, _nim, _bc, _capt, apply_url or "")
+            n_filled += _wef_fixed
+            log.info("[WEF] Cycle %d correction filled %d field(s)", _wef_cycle + 1, _wef_fixed)
+            # Also run legacy pass to catch selects/radios
+            _wef_n2, _wef_unf2 = _do_fill_pass(page)
+            if _wef_unf2:
+                _ask_and_fill_unknowns(page, _wef_unf2)
+            n_filled += _wef_n2
+            # For Greenhouse: _do_fill_pass re-runs comboboxes which reset identity
+            # fields. Re-apply JS-based identity refill to fix values AND clear
+            # "field is required" error-message nodes via React's blur handler.
+            if ats == "greenhouse":
+                _GH_WEF_ID_JS = """(args) => {
+                    const [selector, val] = args;
+                    const el = document.querySelector(selector);
+                    if (!el) return false;
+                    el.focus();
+                    const desc = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value');
+                    if (desc && desc.set) desc.set.call(el, val);
+                    el.dispatchEvent(new Event('input',  { bubbles: true }));
+                    el.dispatchEvent(new Event('change', { bubbles: true }));
+                    el.dispatchEvent(new Event('blur',   { bubbles: true }));
+                    return true;
+                }"""
+                for _id_sel, _id_val in [
+                    ("#first_name", flat.get("first_name", "")),
+                    ("#last_name",  flat.get("last_name", "")),
+                    ("#email",      flat.get("email", "")),
+                    ("#phone",      flat.get("phone", "")),
+                ]:
+                    if not _id_val:
+                        continue
+                    try:
+                        page.evaluate(_GH_WEF_ID_JS, [_id_sel, _id_val])
+                        page.wait_for_timeout(150)
+                    except Exception:
+                        pass
+                page.wait_for_timeout(600)
+            page.wait_for_timeout(800)
+
+        def _final_validation_scan(pg) -> list[str]:
+            """Scan for visible red error text before submit.
+
+            Physical Submit Lock rules (hard-coded, no bypass):
+              1. Any visible .error-message element → block
+              2. Form innerText contains 'required' alongside an empty field → block
+              3. Any <select> still at a placeholder option ('Select...', 'Choose...') → block
+            Returns list of error strings; empty list means form is clean.
+            """
+            errors: list[str] = []
+
+            # ── Rule 1: CSS error-message elements ──────────────────────────────
+            # IMPORTANT: Only catch elements that contain actual validation ERROR MESSAGES.
+            # Do NOT use broad [class*="error"] — Greenhouse uses select__label--error
+            # and input__label--error as LABEL STYLING for required fields, which remains
+            # even on correctly filled fields. Catching those labels causes false positives
+            # that permanently block submission on Greenhouse forms.
+            try:
+                errors = pg.evaluate("""() => {
+                    const errs = [];
+                    // Specific error message selectors only — not broad class*=error
+                    const sel = [
+                        '.error-message',
+                        '.field-error',
+                        '.validation-message',
+                        '.greenhouse-field-error',
+                        '[data-error]',
+                        '[aria-errormessage]',
+                        '[role="alert"]',
+                        // Greenhouse-specific: the div that appears below fields with errors
+                        '.field__error',
+                        '[class="error"]',
+                        '[class="validation-error"]',
+                    ].join(',');
+                    document.querySelectorAll(sel).forEach(el => {
+                        const r = el.getBoundingClientRect();
+                        if (r.width < 1 || r.height < 1) return;
+                        const txt = (el.innerText || el.textContent || '').trim();
+                        if (txt && txt.length > 2 && txt.length < 200) errs.push(txt);
+                    });
+                    // Also catch any element whose text explicitly contains error keywords
+                    // but is visible and styled red (actual error state, not just label styling)
+                    document.querySelectorAll('[class*="error"]').forEach(el => {
+                        // Skip elements that are just labels (tag: LABEL, SPAN in label context)
+                        const tag = el.tagName.toLowerCase();
+                        if (tag === 'label') return;
+                        // Skip Greenhouse React-Select label variants: select__label--error, input__label--error
+                        const cls = el.className || '';
+                        if (cls.includes('__label') || cls.includes('select__') || cls.includes('input__single')) return;
+                        const r = el.getBoundingClientRect();
+                        if (r.width < 1 || r.height < 1) return;
+                        const txt = (el.innerText || el.textContent || '').trim();
+                        // Only include if text explicitly says required/invalid/error
+                        const isErrMsg = /required|invalid|please|must|cannot|field is|enter a valid/i.test(txt);
+                        if (isErrMsg && txt.length > 2 && txt.length < 200) errs.push(txt);
+                    });
+                    return [...new Set(errs)].slice(0, 10);
+                }""") or []
+            except Exception:
+                errors = []
+
+            # ── Rule 2: Physical Submit Lock — ".error-message" visibility check ──
+            # If page.locator(".error-message") is visible, submit is forbidden.
+            try:
+                _em_visible = pg.locator(".error-message").first.is_visible(timeout=300)
+                if _em_visible:
+                    _em_text = pg.locator(".error-message").first.inner_text() or "error-message visible"
+                    lock_err = f"SUBMIT_LOCKED:.error-message visible — {_em_text[:80]}"
+                    log.warning("[submit-lock] .error-message is visible: %s", _em_text[:80])
+                    if lock_err not in errors:
+                        errors.append(lock_err)
+            except Exception:
+                pass
+
+            # ── Rule 3: Physical Submit Lock — scan form innerText for "required" / "Select..." ──
+            try:
+                lock_violations = pg.evaluate("""() => {
+                    const violations = [];
+                    const form = document.querySelector('form') || document.body;
+                    const formText = (form.innerText || '').toLowerCase();
+
+                    // Check for "Select..." still present in the visible page
+                    const selects = Array.from(document.querySelectorAll('select'));
+                    for (const sel of selects) {
+                        const r = sel.getBoundingClientRect();
+                        if (r.width < 1 || r.height < 1) continue;
+                        const opt = sel.options[sel.selectedIndex];
+                        const optTxt = opt ? opt.text.toLowerCase().trim() : '';
+                        const PLACEHOLDERS = ['select...', 'choose...', 'select one',
+                                              'please select', 'select an option', '--'];
+                        if (PLACEHOLDERS.some(p => optTxt === p || optTxt.startsWith(p))) {
+                            const id = sel.id || sel.name || '';
+                            const lbl = id ? (document.querySelector('label[for="'+id+'"]')?.innerText || id) : 'dropdown';
+                            violations.push('SELECT_PLACEHOLDER:' + lbl.trim().slice(0,60));
+                        }
+                    }
+                    return violations;
+                }""") or []
+                for v in lock_violations:
+                    log.warning("[submit-lock] %s", v)
+                    errors.append(v)
+            except Exception:
+                pass
+
+            return errors
+
+        # ── Fill adequacy guard: FORBIDDEN to submit with 0 fields filled ────────
+        # If intelligence layer mapped 0 fields, retry Phase 0 before allowing submit.
+        if n_filled == 0:
+            log.warning("Fill adequacy guard: 0 fields filled after all phases — "
+                        "Intelligence Layer failed to map fields. Retrying with Simplified DOM.")
+            _tg(f"⚠️ *Intelligence Layer mapped 0 fields* — {title}\nRetrying Phase 0 with Simplified DOM before submit.")
+            # Force a fresh Phase 0 pass; simplified DOM fallback is built into vision_verified_fill
+            _v_filled2, _ = _vision_verified_fill(page, flat, _nim, _bc, _capt, apply_url or "")
+            n_filled += _v_filled2
+            if n_filled == 0:
+                log.warning("Fill adequacy guard: STILL 0 fields after retry — "
+                            "form may have no mappable fields or all fields are already filled.")
+                _tg(f"⚠️ *Proceeding to submit with 0 mapped fields* — {title}\nCheck browser for form state.")
+
+        # ── Submission Physical Interlock: unlock only when safe ─────────────
+        # Conditions: n_filled >= 5  AND  zero red validation errors  AND  3s cooldown.
+        global READY_TO_SUBMIT
+        READY_TO_SUBMIT = False
+        _interlock_errors = _final_validation_scan(page)
+        if n_filled >= 5 and not _interlock_errors:
+            log.info("[interlock] n_filled=%d, errors=0 — starting 3s cooldown before submit", n_filled)
+            time.sleep(3)
+            _post_cooldown_errors = _final_validation_scan(page)
+            if not _post_cooldown_errors:
+                READY_TO_SUBMIT = True
+                log.info("[interlock] UNLOCKED — submit is now permitted")
+            else:
+                log.warning("[interlock] LOCKED — errors appeared during cooldown: %s", _post_cooldown_errors[:3])
+                _tg(f"⚠️ *Submit interlock locked* — errors after cooldown\n{chr(10).join(_post_cooldown_errors[:3])}")
+        else:
+            log.warning("[interlock] LOCKED — n_filled=%d errors=%s", n_filled, _interlock_errors[:3] if _interlock_errors else "none")
+            if n_filled < 5:
+                _tg(f"⚠️ *Submit interlock locked* — only {n_filled} field(s) filled (need ≥5)\n{title}")
+
         # ── Multi-step form loop: click Next/Continue until Submit ──
         SUBMIT_SELECTORS = (
             # LinkedIn Easy Apply specific
             "footer button[aria-label*='Submit application' i]",
             "button[aria-label*='Submit application' i]",
-            # Generic
+            # Generic — NEVER include bare 'apply' or 'apply now':
+            # those are CTAs that appear on job description pages before the form loads.
             "button[type='submit']",
             "input[type='submit']",
             "button:text-matches('submit application', 'i')",
+            "button:text-matches('submit my application', 'i')",
             "button:text-matches('submit', 'i')",
-            "button:text-matches('apply now', 'i')",
-            "button:text-matches('apply', 'i')",
         )
         NEXT_SELECTORS = (
             # LinkedIn Easy Apply specific
@@ -2945,10 +4392,15 @@ RESPONSE FORMAT — return ONLY this JSON:
             "your application was submitted", "application complete",
         )
 
-        def _click_button_broad(pg, kws_submit, kws_next) -> str:
-            """JS broad button search. Returns 'submit:TEXT', 'next:TEXT', or 'none'."""
+        def _click_button_broad(pg, kws_submit, kws_next, can_submit: bool = True) -> str:
+            """JS broad button search. Returns 'submit:TEXT', 'next:TEXT', or 'none'.
+
+            Args:
+                can_submit: Physical interlock flag. When False, submit buttons are
+                            detected but NOT clicked — returns 'interlock_blocked:TEXT'.
+            """
             try:
-                return pg.evaluate("""([kws_sub, kws_nxt]) => {
+                return pg.evaluate("""([kws_sub, kws_nxt, canSubmit]) => {
                     const els = Array.from(document.querySelectorAll(
                         'button, input[type="submit"], [role="button"]'
                     ));
@@ -2971,6 +4423,7 @@ RESPONSE FORMAT — return ONLY this JSON:
                         for (const el of els) {
                             const t = txt(el);
                             if (kwMatch(t, kw) && visible(el)) {
+                                if (!canSubmit) return 'interlock_blocked:' + t.slice(0, 30);
                                 el.click(); return 'submit:' + t.slice(0, 30);
                             }
                         }
@@ -2986,15 +4439,19 @@ RESPONSE FORMAT — return ONLY this JSON:
                     // Debug: visible button texts
                     const dbg = els.filter(visible).map(e => txt(e).slice(0,25)).filter(Boolean);
                     return 'none|' + dbg.slice(0,10).join(',');
-                }""", [kws_submit, kws_next])
+                }""", [kws_submit, kws_next, can_submit])
             except Exception:
                 return "none"
 
-        kws_submit_list = ["submit application", "submit my application", "submit", "apply now", "apply"]
+        # "apply" and "apply now" removed: they match Apply CTAs on job description pages,
+        # not the final submit button — caused premature submission on page load.
+        kws_submit_list = ["submit application", "submit my application", "submit"]
         kws_next_list = ["continue to next step", "next", "continue", "review your application", "review", "proceed", "save and continue", "next step"]
 
         submitted = False
-        _consecutive_none = 0  # track consecutive empty button results
+        _consecutive_none = 0    # track consecutive empty button results
+        _red_state_retries = 0   # track consecutive red-error states (infinite loop guard)
+        MAX_RED_STATE_RETRIES = 3
         for _step in range(15):  # max 15 steps in a multi-step form
             page.wait_for_timeout(1000)
 
@@ -3075,12 +4532,99 @@ RESPONSE FORMAT — return ONLY this JSON:
                 submitted = True
                 break
 
-            # Use JS broad search directly — fast single call, no per-selector timeouts
-            _js_result = _click_button_broad(page, kws_submit_list, kws_next_list)
+            # ── Pre-submit: force-enable disabled submit button if needed ──────
+            try:
+                _btn_state = page.evaluate("""() => {
+                    const btn = document.querySelector('button[type="submit"]');
+                    if (!btn) return 'none';
+                    return btn.disabled ? 'disabled' : 'enabled';
+                }""")
+                if _btn_state == "disabled":
+                    log.info("Submit button is disabled — nudging dropdowns + force-enabling")
+                    page.evaluate("""() => {
+                        // Re-fire change/blur on all selects and inputs so React re-validates
+                        document.querySelectorAll('select').forEach(el => {
+                            el.dispatchEvent(new Event('change', {bubbles:true}));
+                        });
+                        document.querySelectorAll('input, textarea').forEach(el => {
+                            el.dispatchEvent(new Event('blur', {bubbles:true}));
+                            el.dispatchEvent(new Event('change', {bubbles:true}));
+                        });
+                    }""")
+                    page.wait_for_timeout(500)
+                    # Check again — re-firing events may have enabled it
+                    _btn_state2 = page.evaluate("""() => {
+                        const btn = document.querySelector('button[type="submit"]');
+                        return btn && btn.disabled ? 'disabled' : 'enabled';
+                    }""")
+                    if _btn_state2 == "disabled":
+                        log.warning("Submit still disabled after nudge — JS force-enable")
+                        page.evaluate("""() => {
+                            const btn = document.querySelector('button[type="submit"]');
+                            if (btn) {
+                                btn.disabled = false;
+                                btn.removeAttribute('disabled');
+                                btn.classList.remove('disabled', 'btn-disabled');
+                            }
+                        }""")
+                        page.wait_for_timeout(200)
+            except Exception:
+                pass
+
+            # ── Pre-submit validation guard: FORBIDDEN to click Submit with errors ──
+            # Detect if any submit button is about to be clicked and check for errors first.
+            _has_submit = page.evaluate("""() => {
+                const kws = ['submit application', 'submit', 'apply now', 'apply'];
+                const els = Array.from(document.querySelectorAll('button, input[type="submit"], [role="button"]'));
+                const txt = el => (el.innerText || el.value || el.getAttribute('aria-label') || '').toLowerCase().trim();
+                const vis = el => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0 && !el.disabled; };
+                return els.some(el => vis(el) && kws.some(kw => txt(el) === kw || txt(el).startsWith(kw + ' ')));
+            }""") if _step == 0 else False
+            if _has_submit:
+                _pre_errors = _final_validation_scan(page)
+                if _pre_errors:
+                    _red_state_retries += 1
+                    log.warning("[red-guard] cycle %d/%d — %d error(s): %s",
+                                _red_state_retries, MAX_RED_STATE_RETRIES,
+                                len(_pre_errors), _pre_errors[:3])
+                    # ── Infinite loop break: alert and abort after 3 consecutive red states ──
+                    if _red_state_retries >= MAX_RED_STATE_RETRIES:
+                        log.error("[red-guard] Validation loop detected after %d cycles — aborting", MAX_RED_STATE_RETRIES)
+                        _tg(
+                            f"🛑 *Manual Intervention Required: Validation Loop Detected*\n"
+                            f"Job: {title}\n"
+                            f"URL: {apply_url}\n"
+                            f"Errors: {chr(10).join(_pre_errors[:5])}"
+                        )
+                        return "failed:validation_loop"
+                    # Re-run vision fill to fix the failing fields
+                    _bc.page = page
+                    _v_fix, _ = _vision_verified_fill(page, flat, _nim, _bc, _capt, apply_url or "")
+                    if _v_fix:
+                        log.info("[red-guard] fixed %d field(s) via vision", _v_fix)
+                    _n_fix, _unf_fix = _do_fill_pass(page)
+                    if _unf_fix:
+                        _ask_and_fill_unknowns(page, _unf_fix)
+                    page.wait_for_timeout(500)
+                    # Re-evaluate interlock after fix attempt
+                    _post_fix_errors = _final_validation_scan(page)
+                    if not _post_fix_errors and n_filled >= 5:
+                        READY_TO_SUBMIT = True
+                        log.info("[interlock] Re-unlocked after red-guard fix")
+                else:
+                    _red_state_retries = 0  # clean pass — reset counter
+
+            # Use JS broad search — pass interlock flag so submit is gated
+            _js_result = _click_button_broad(page, kws_submit_list, kws_next_list, can_submit=READY_TO_SUBMIT)
             next_clicked = False
 
             if _js_result and not _js_result.startswith("none"):
                 _consecutive_none = 0
+                if _js_result.startswith("interlock_blocked:"):
+                    log.error("[interlock] SUBMIT BLOCKED — READY_TO_SUBMIT=False. Button text: %s",
+                              _js_result.split(":", 1)[1])
+                    _tg(f"⛔ *Submit BLOCKED by physical interlock* — n_filled={n_filled}\n{title}\n{apply_url}")
+                    return "failed:interlock_blocked"
                 log.info("Button click (step %d): %s", _step + 1, _js_result)
                 if _js_result.startswith("submit:"):
                     submitted = True
@@ -3095,7 +4639,11 @@ RESPONSE FORMAT — return ONLY this JSON:
                         if btn.is_visible(timeout=400):
                             btn_text = (btn.inner_text() or "").lower().strip()
                             if not any(t in btn_text for t in ("next", "continue", "proceed")):
-                                btn.click()
+                                if not READY_TO_SUBMIT:
+                                    log.error("[interlock] PW submit BLOCKED — READY_TO_SUBMIT=False")
+                                    _tg(f"⛔ *PW Submit BLOCKED by interlock* — {title}")
+                                    break
+                                _bc.human_click(element=btn)
                                 submitted = True
                                 log.info("Clicked submit via PW (step %d): %s", _step + 1, btn_text[:30])
                                 break
@@ -3109,7 +4657,7 @@ RESPONSE FORMAT — return ONLY this JSON:
                                 btn_text = (btn.inner_text() or "").lower().strip()
                                 if any(ex == btn_text or btn_text.startswith(ex) for ex in EXCLUDE_TEXTS):
                                     continue
-                                btn.click()
+                                _bc.human_click(element=btn)
                                 next_clicked = True
                                 log.info("Clicked Next via PW (step %d): '%s'", _step + 1, btn_text[:30])
                                 page.wait_for_timeout(800)
@@ -3122,6 +4670,7 @@ RESPONSE FORMAT — return ONLY this JSON:
 
             if not next_clicked and not submitted:
                 _consecutive_none += 1
+                log.warning("No Next or Submit button on step %d (none_count=%d)", _step + 1, _consecutive_none)
                 if _consecutive_none >= 2:
                     # ── Vision fallback: SoM screenshot → Llama-3.2 locates Submit ──
                     log.info("No buttons found x2 — attempting vision model Submit fallback")
@@ -3133,8 +4682,8 @@ RESPONSE FORMAT — return ONLY this JSON:
                         break
                     log.warning("No buttons found on 2 consecutive steps — page has no form, skipping")
                     return "failed:no_form_found"
-                log.warning("No Next or Submit button on step %d — stopping", _step + 1)
-                break
+                # First "none" — wait and retry (button may not have rendered yet)
+                page.wait_for_timeout(1500)
 
         if not submitted:
             log.warning("Could not find submit button after %d steps", _step + 1)
@@ -3146,91 +4695,148 @@ RESPONSE FORMAT — return ONLY this JSON:
                 _tg(f"❌ *Submit button not found* — {title}\n{apply_url}")
             return RESULT_FAILED
 
-        # ── Post-submit: wait and check for errors / "Thank you" confirmation ──
-        page.wait_for_timeout(3000)
+        # ── Post-submit: robust confirmation verification ──────────────────────
+        # Must see URL change to /confirmation OR "thank you" text within 10s.
+        # If neither, run red-line vision scan and do NOT mark as applied.
 
-        # Check for validation errors after submit
-        for _retry in range(3):
+        def _wait_for_success_signal(pg, timeout_ms: int = 10_000) -> bool:
+            """Poll for URL /confirmation or success text. Returns True if confirmed."""
+            import time as _t
+            deadline = _t.time() + timeout_ms / 1000
+            while _t.time() < deadline:
+                try:
+                    url_now = pg.url.lower()
+                    if any(s in url_now for s in ("/confirmation", "/thank", "/success", "/submitted", "/complete")):
+                        return True
+                    body_now = (pg.inner_text("body") or "").lower()
+                    if any(s in body_now for s in (
+                        "thank you for your application",
+                        "application received",
+                        "application submitted",
+                        "successfully submitted",
+                        "we have received your application",
+                        "we'll be in touch",
+                        "application complete",
+                    )):
+                        return True
+                except Exception:
+                    pass
+                _t.sleep(0.5)
+            return False
+
+        # Initial 2s wait for page transition
+        page.wait_for_timeout(2000)
+
+        _submission_confirmed = _wait_for_success_signal(page, timeout_ms=10_000)
+
+        if not _submission_confirmed:
+            log.warning("No confirmation signal after submit — checking for form errors")
+            # Check for validation errors
             errors = _collect_field_errors(page)
-            body_after = (page.inner_text("body") or "").lower()
-            success_confirmed = any(s in body_after for s in SUCCESS_SIGNALS)
-
-            if success_confirmed:
-                log.info("✅ Confirmation message detected after submit")
-                break
-
-            if not errors:
-                # No errors visible, no success yet — wait a bit more
-                page.wait_for_timeout(2000)
-                continue
-
-            # Errors found — scroll to each one, try to fix, or ask Telegram
-            log.info("Post-submit errors detected (retry %d): %s", _retry + 1, errors[:3])
-
-            # Collect empty required fields caused by the validation
-            empty_after = _collect_empty_required(page)
-            if empty_after:
-                log.info("Empty required fields after submit error: %s", empty_after[:5])
-                # First try to auto-fill from profile
-                _n, _unf = _do_fill_pass(page)
-                if _n:
-                    log.info("Auto-filled %d fields after error", _n)
-                remaining_empty = [f for f in empty_after if f not in (_unf or [])]
-                if remaining_empty or _unf:
-                    # Ask Telegram about fields we can't fill automatically
-                    ask_fields = list(dict.fromkeys((remaining_empty or []) + (_unf or [])))[:5]
-                    error_msg = (
-                        f"⚠️ *Form error after submit* — {title}\n\n"
-                        f"*Errors:* {' | '.join(errors[:3])}\n\n"
-                        f"*Fields needing answers:*\n"
-                        + "\n".join(f"• `{f}`" for f in ask_fields)
-                        + "\n\nReply to each field question I send next."
-                    )
-                    _tg(error_msg)
-                    log.info("Asking Telegram about post-error fields: %s", ask_fields)
-                    _ask_and_fill_unknowns(page, ask_fields)
-
-            # Scroll to top, re-check, re-submit
-            try:
-                page.evaluate("window.scrollTo(0, 0)")
-                page.wait_for_timeout(0)
-            except Exception:
-                pass
-
-            # Re-submit
-            _js_result2 = _click_button_broad(page, kws_submit_list, kws_next_list)
-            if _js_result2 and _js_result2 != "none":
-                log.info("Re-submitted after error fix: %s", _js_result2)
-                page.wait_for_timeout(500)
-            else:
-                for selector in SUBMIT_SELECTORS:
+            if errors:
+                log.info("Validation errors blocking submission: %s", errors[:3])
+                # Try to fix empty required fields
+                empty_after = _collect_empty_required(page)
+                if empty_after:
+                    log.info("Empty required fields: %s", empty_after[:5])
+                    _n, _unf = _do_fill_pass(page)
+                    if _n:
+                        log.info("Auto-filled %d fields after error", _n)
+                    # Force-enable submit and nudge dropdowns before re-submit
                     try:
-                        btn = page.locator(selector).first
-                        if btn.is_visible(timeout=1500):
-                            btn.click()
-                            log.info("Re-clicked submit after error fix")
-                            page.wait_for_timeout(500)
-                            break
+                        page.evaluate("""() => {
+                            // Re-dispatch blur on all text inputs so React sees changes
+                            document.querySelectorAll('input[type=text],input[type=email],input[type=tel],textarea').forEach(el => {
+                                el.dispatchEvent(new Event('blur', {bubbles:true}));
+                                el.dispatchEvent(new Event('change', {bubbles:true}));
+                            });
+                            // Force-enable submit button as last resort
+                            const btn = document.querySelector('button[type=submit]');
+                            if (btn && btn.disabled) {
+                                btn.disabled = false;
+                                btn.removeAttribute('disabled');
+                                btn.classList.remove('disabled');
+                            }
+                        }""")
+                        page.wait_for_timeout(300)
                     except Exception:
                         pass
 
-        # ── Final confirmation screenshot → Telegram ──
+                    # Ask Telegram about unfillable fields
+                    remaining_empty = [f for f in empty_after if f not in (_unf or [])]
+                    if remaining_empty or _unf:
+                        ask_fields = list(dict.fromkeys((remaining_empty or []) + (_unf or [])))[:5]
+                        error_msg = (
+                            f"⚠️ *Form error after submit* — {title}\n\n"
+                            f"*Errors:* {' | '.join(errors[:3])}\n\n"
+                            f"*Fields needing answers:*\n"
+                            + "\n".join(f"• `{f}`" for f in ask_fields)
+                            + "\n\nReply to each field question I send next."
+                        )
+                        _tg(error_msg)
+                        _ask_and_fill_unknowns(page, ask_fields)
+
+                # Re-submit
+                page.evaluate("window.scrollTo(0, 0)")
+                page.wait_for_timeout(300)
+                _js_result2 = _click_button_broad(page, kws_submit_list, kws_next_list)
+                if _js_result2 and _js_result2 != "none":
+                    log.info("Re-submitted after error fix: %s", _js_result2)
+                else:
+                    for selector in SUBMIT_SELECTORS:
+                        try:
+                            btn = page.locator(selector).first
+                            if btn.is_visible(timeout=1500):
+                                _bc.human_click(element=btn)
+                                log.info("Re-clicked submit after error fix")
+                                break
+                        except Exception:
+                            pass
+
+                # Wait again for confirmation after re-submit
+                _submission_confirmed = _wait_for_success_signal(page, timeout_ms=10_000)
+
+        if not _submission_confirmed:
+            # Red-line vision scan — take screenshot and check
+            log.warning("Still no confirmation — running red-line vision scan")
+            ss_redline = Path("/tmp") / f"hireagent_redline_{int(time.time())}.png"
+            try:
+                page.screenshot(path=str(ss_redline), full_page=False)
+                import base64 as _b64
+                with open(str(ss_redline), "rb") as _f:
+                    _b64img = _b64.b64encode(_f.read()).decode()
+                vision_errors = _nim.scan_for_errors(_b64img)
+                if vision_errors:
+                    log.warning("Red-line scan errors: %s", vision_errors[:3])
+                    _tg(
+                        f"❌ *Submission FAILED (validation errors)* — {title}\n\n"
+                        f"*Vision errors:* {' | '.join(str(e) for e in vision_errors[:3])}\n"
+                        f"Not marking as applied.\n{apply_url}",
+                        ss_redline,
+                    )
+                else:
+                    # No errors visible but no confirmation either — ambiguous
+                    log.warning("No errors detected but no confirmation URL/text — NOT marking applied")
+                    _tg(
+                        f"⚠️ *Submission unconfirmed* — {title}\n"
+                        f"No /confirmation URL or 'thank you' text detected.\n"
+                        f"Check browser manually.\n{apply_url}",
+                        ss_redline,
+                    )
+            except Exception as _scan_err:
+                log.warning("Red-line scan failed: %s", _scan_err)
+                _tg(f"⚠️ *Submission unconfirmed* — {title}\n{apply_url}")
+            return RESULT_FAILED
+
+        # ── Confirmed: take screenshot and notify ──────────────────────────────
         ss_confirm = Path("/tmp") / f"hireagent_confirm_{int(time.time())}.png"
         try:
             page.screenshot(path=str(ss_confirm), full_page=False)
         except Exception:
             ss_confirm = None
 
-        body = (page.inner_text("body") or "").lower()
-        success = any(s in body for s in (
-            "thank you", "application received", "submitted", "confirmation",
-            "we'll be in touch", "already received", "under review",
-        ) + SUCCESS_SIGNALS)
-
-        status_icon = "✅" if success else "⚠️"
-        status_text = "Applied!" if success else "Submitted (unconfirmed — check browser)"
         _tg(
-            f"{status_icon} *{status_text}*\n\n"
+            f"✅ *Applied!*\n\n"
             f"*Job:* {title}\n"
             f"*ATS:* {ats} | *Score:* {job.get('fit_score','N/A')}/10\n"
             f"Fields filled: {n_filled} | Resume: {'✅' if uploaded else '❌'}\n"

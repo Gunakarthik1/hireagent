@@ -25,6 +25,39 @@ _LATEX_ESCAPE_MAP = {
     "}": r"\}",
     "~": r"\textasciitilde{}",
     "^": r"\textasciicircum{}",
+    # Common unicode that LLMs output — map to safe ASCII/LaTeX equivalents
+    "\u2192": r"$\rightarrow$",   # →
+    "\u2190": r"$\leftarrow$",    # ←
+    "\u2194": r"$\leftrightarrow$",  # ↔
+    "\u00d7": r"$\times$",        # ×
+    "\u00f7": r"$\div$",          # ÷
+    "\u2265": r"$\geq$",          # ≥
+    "\u2264": r"$\leq$",          # ≤
+    "\u2260": r"$\neq$",          # ≠
+    "\u00b1": r"$\pm$",           # ±
+    "\u2248": r"$\approx$",       # ≈
+    "\u00b0": r"$^{\circ}$",      # °
+    "\u03b1": r"$\alpha$",        # α
+    "\u03b2": r"$\beta$",         # β
+    "\u03b3": r"$\gamma$",        # γ
+    "\u03bb": r"$\lambda$",       # λ
+    "\u03bc": r"$\mu$",           # μ
+    "\u03c0": r"$\pi$",           # π
+    "\u03c3": r"$\sigma$",        # σ
+    "\u2022": r"\textbullet{}",   # • (bullet point)
+    "\u25cf": r"\textbullet{}",   # ● (filled circle)
+    "\u2713": r"\checkmark{}",    # ✓
+    "\u00e9": r"\'{e}",           # é
+    "\u00e8": r"\`{e}",           # è
+    "\u00ea": r"\^{e}",           # ê
+    "\u00e0": r"\`{a}",           # à
+    "\u00e2": r"\^{a}",           # â
+    "\u00f3": r"\'{o}",           # ó
+    "\u00f6": r'"{o}',            # ö
+    "\u00fc": r'"{u}',            # ü
+    "\u00e4": r'"{a}',            # ä
+    "\u00e7": r"\c{c}",           # ç
+    "\u00f1": r"\~{n}",           # ñ
 }
 
 

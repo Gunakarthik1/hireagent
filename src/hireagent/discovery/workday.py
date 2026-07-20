@@ -167,9 +167,26 @@ def workday_search(employer: dict, search_text: str, limit: int = 20, offset: in
     req.add_header("Content-Type", "application/json")
     req.add_header("Accept", "application/json")
     req.add_header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+    req.add_header("Origin", employer["base_url"])
+    req.add_header("Referer", f"{employer['base_url']}/en-US/jobs")
 
-    with _urlopen(req, timeout=30) as resp:
-        return json.loads(resp.read())
+    try:
+        with _urlopen(req, timeout=30) as resp:
+            body = resp.read()
+            if not body:
+                raise ValueError("Empty response body")
+            return json.loads(body)
+    except urllib.error.HTTPError as e:
+        code = e.code
+        if code == 401:
+            raise RuntimeError(f"HTTP 401 Unauthorized — {employer['name']} requires auth, mark disabled")
+        if code == 403:
+            raise RuntimeError(f"HTTP 403 Forbidden — {employer['name']} blocked scraping")
+        if code == 422:
+            raise RuntimeError(f"HTTP 422 Unprocessable Entity — {employer['name']} rejected payload (site_id or tenant may be wrong)")
+        if code == 404:
+            raise RuntimeError(f"HTTP 404 Not Found — {employer['name']} endpoint not found (URL or site_id changed)")
+        raise RuntimeError(f"HTTP Error {code}: {e.reason}")
 
 
 def workday_detail(employer: dict, external_path: str) -> dict:
@@ -414,7 +431,10 @@ def scrape_employers(
     errors = 0
     t0 = time.time()
 
-    valid_keys = [k for k in employer_keys if k in employers]
+    valid_keys = [k for k in employer_keys if k in employers and not employers[k].get("disabled", False)]
+    skipped = [k for k in employer_keys if k in employers and employers[k].get("disabled", False)]
+    if skipped:
+        log.info("Skipping %d disabled employers: %s", len(skipped), ", ".join(skipped))
 
     if workers > 1 and len(valid_keys) > 1:
         # Parallel mode

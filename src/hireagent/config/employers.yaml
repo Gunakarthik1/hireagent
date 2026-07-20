@@ -1,5 +1,6 @@
 # Workday employer registry for HireAgent
 # US-only tech companies — focused on entry-level / new grad SWE roles
+# disabled: true  →  employer is skipped (API changed, auth required, or company left Workday)
 
 employers:
 
@@ -40,6 +41,7 @@ employers:
     tenant: "uber"
     site_id: "uberCareers"
     base_url: "https://uber.wd5.myworkdayjobs.com"
+    disabled: true  # 422 — Workday instance requires CSRF token / blocked scraping
 
   workday:
     name: "Workday"
@@ -52,12 +54,14 @@ employers:
     tenant: "servicenow"
     site_id: "ServiceNowCareers"
     base_url: "https://servicenow.wd1.myworkdayjobs.com"
+    disabled: true  # 422 — API format changed, requires additional headers
 
   docusign:
     name: "DocuSign"
     tenant: "docusign"
     site_id: "External"
     base_url: "https://docusign.wd5.myworkdayjobs.com"
+    disabled: true  # 422 — API blocked
 
   motorola:
     name: "Motorola Solutions"
@@ -85,9 +89,7 @@ employers:
 
   netflix:
     name: "Netflix"
-    tenant: "netflix"
-    site_id: "Netflix"
-    base_url: "https://netflix.wd1.myworkdayjobs.com"
+    disabled: true  # Netflix moved to Lever: jobs.lever.co/netflix — not on Workday
 
   # ── Growth-stage / Mid-size US Tech ─────────────────────────────────────
 
@@ -96,57 +98,67 @@ employers:
     tenant: "twilio"
     site_id: "Twilio"
     base_url: "https://twilio.wd5.myworkdayjobs.com"
+    disabled: true  # 422 — Twilio's Workday instance blocks API access
 
   crowdstrike:
     name: "CrowdStrike"
     tenant: "crowdstrike"
-    site_id: "crowdstrike"
+    site_id: "crowdstrikecareers"
     base_url: "https://crowdstrike.wd5.myworkdayjobs.com"
+    # Fixed site_id: was "crowdstrike", corrected to "crowdstrikecareers"
 
   palo_alto:
     name: "Palo Alto Networks"
     tenant: "paloaltonetworks"
     site_id: "ExternalJobBoard"
     base_url: "https://paloaltonetworks.wd1.myworkdayjobs.com"
+    disabled: true  # 422 — API blocked
 
   fortinet:
     name: "Fortinet"
     tenant: "fortinet"
-    site_id: "careers"
+    site_id: "External"
     base_url: "https://fortinet.wd3.myworkdayjobs.com"
+    # Fixed site_id: was "careers"
 
   splunk:
     name: "Splunk"
     tenant: "splunk"
-    site_id: "splunk"
+    site_id: "splunk_external_career_site"
     base_url: "https://splunk.wd5.myworkdayjobs.com"
+    # Fixed site_id (acquired by Cisco, careers site changed)
 
   databricks:
     name: "Databricks"
     tenant: "databricks"
     site_id: "External_Career_Site"
     base_url: "https://databricks.wd5.myworkdayjobs.com"
+    disabled: true  # 422 — API blocked
 
   confluent:
     name: "Confluent"
     tenant: "confluent"
     site_id: "careers"
     base_url: "https://confluent.wd5.myworkdayjobs.com"
+    disabled: true  # 401 — Workday instance requires authentication
 
   elastic:
     name: "Elastic"
     tenant: "elastic"
     site_id: "elastic"
     base_url: "https://elastic.wd5.myworkdayjobs.com"
+    disabled: true  # 401 — Workday instance requires authentication
 
   cloudflare:
     name: "Cloudflare"
     tenant: "cloudflare"
     site_id: "careers"
     base_url: "https://cloudflare.wd5.myworkdayjobs.com"
+    disabled: true  # 401 — Workday instance requires authentication
 
   datadog:
     name: "Datadog"
     tenant: "datadog"
     site_id: "careers"
     base_url: "https://datadog.wd5.myworkdayjobs.com"
+    disabled: true  # 401 — Workday instance requires authentication

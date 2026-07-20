@@ -71,7 +71,7 @@ def _parse_score_response(response: str) -> dict:
         keywords = f"MATCHED: {matched} | MISSING: {missing}" if (matched or missing) else ""
         return {"score": score, "keywords": keywords, "reasoning": reasoning}
     except (json.JSONDecodeError, ValueError, TypeError):
-        # Fallback: try legacy plain-text format
+        # Fallback: try legacy plain-text format and Ollama markdown format
         score = 0
         keywords = ""
         reasoning = response
@@ -87,6 +87,18 @@ def _parse_score_response(response: str) -> dict:
                 keywords = line.replace("KEYWORDS:", "").strip()
             elif line.startswith("REASONING:"):
                 reasoning = line.replace("REASONING:", "").strip()
+
+        # If no SCORE: found, try to extract from Ollama markdown responses:
+        # "**Final score:** 7-8 (Good match)" or "**Final score:** 5/10"
+        if score == 0:
+            m = re.search(r"(?:final\s+score|score)[:\s*]+(\d+)(?:[/-](\d+))?", response, re.IGNORECASE)
+            if m:
+                try:
+                    score = int(m.group(1))
+                    score = max(0, min(10, score))
+                except (ValueError, TypeError):
+                    score = 0
+
         return {"score": score, "keywords": keywords, "reasoning": reasoning}
 
 
@@ -156,45 +168,83 @@ def run_scoring(limit: int = 0, rescore: bool = False) -> dict:
         columns = jobs[0].keys()
         jobs = [dict(zip(columns, row)) for row in jobs]
 
-    log.info("Scoring %d jobs sequentially...", len(jobs))
+    # Parallel workers: default 5, override via HIREAGENT_SCORE_WORKERS env var.
+    # Throttled/local-LLM setups should set HIREAGENT_SCORE_WORKERS=1.
+    score_workers = int(os.environ.get("HIREAGENT_SCORE_WORKERS", "5") or 5)
+    throttle = float(os.environ.get("HIREAGENT_LLM_SLEEP_SECONDS", "0") or 0)
+    if throttle > 0:
+        score_workers = 1  # honour throttle: serial mode only
+
+    log.info("Scoring %d jobs (%d parallel workers)...", len(jobs), score_workers)
     t0 = time.time()
-    completed = 0
     errors = 0
     results: list[dict] = []
 
-    # Optional throttle for constrained local LLM throughput.
-    # Set HIREAGENT_LLM_SLEEP_SECONDS to a float (seconds) to pause between calls.
-    throttle = float(os.environ.get("HIREAGENT_LLM_SLEEP_SECONDS", "0") or 0)
+    from hireagent.eligibility import classify_job_eligibility, classify_job_data_quality
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    import threading
+    skipped = 0
+    _lock = threading.Lock()
+    _completed = 0
 
-    for job in jobs:
+    def _score_one(job: dict) -> dict | None:
+        nonlocal skipped, _completed
+        title = str(job.get("title") or "?")[:60]
+        _, _ = classify_job_data_quality(job)
+        eligibility = classify_job_eligibility(job)
+        if not eligibility["final_eligible"]:
+            reason = ";".join(eligibility.get("reasons", ["ineligible"]))
+            with _lock:
+                skipped += 1
+                _completed += 1
+                log.info("[%d/%d] score=0 (skipped-ineligible: %s)  %s",
+                         _completed, len(jobs), reason[:40], title)
+            return {"url": job["url"], "score": 0,
+                    "keywords": "", "reasoning": f"skipped:{reason}", "_ineligible": True}
         result = score_job(resume_text, job)
         result["url"] = job["url"]
-        completed += 1
+        with _lock:
+            _completed += 1
+            log.info("[%d/%d] score=%d  %s", _completed, len(jobs), result["score"], title)
+        return result
 
-        if result["score"] == 0:
-            errors += 1
-
-        results.append(result)
-
-        log.info(
-            "[%d/%d] score=%d  %s",
-            completed, len(jobs), result["score"], str(job.get("title") or "?")[:60],
-        )
-
-        if throttle > 0:
-            time.sleep(throttle)
-
-    # Write scores to DB
     now = datetime.now(timezone.utc).isoformat()
-    for r in results:
+    _COMMIT_BATCH = 20  # write to DB every N results so progress survives kills
+
+    with ThreadPoolExecutor(max_workers=score_workers) as pool:
+        futures = {pool.submit(_score_one, job): job for job in jobs}
+        for future in as_completed(futures):
+            try:
+                r = future.result()
+                if r:
+                    results.append(r)
+                    if r["score"] == 0 and not r.get("_ineligible"):
+                        errors += 1
+                    # Incremental commit every COMMIT_BATCH results
+                    if len(results) % _COMMIT_BATCH == 0:
+                        for _r in results[-_COMMIT_BATCH:]:
+                            conn.execute(
+                                "UPDATE jobs SET fit_score = ?, score_reasoning = ?, scored_at = ? WHERE url = ?",
+                                (_r["score"], f"{_r['keywords']}\n{_r['reasoning']}", now, _r["url"]),
+                            )
+                        conn.commit()
+            except Exception as exc:
+                log.error("Score worker error: %s", exc)
+                errors += 1
+
+    # Final commit for any remaining results not yet flushed
+    remainder = results[-(len(results) % _COMMIT_BATCH):] if len(results) % _COMMIT_BATCH else []
+    for r in remainder:
         conn.execute(
             "UPDATE jobs SET fit_score = ?, score_reasoning = ?, scored_at = ? WHERE url = ?",
             (r["score"], f"{r['keywords']}\n{r['reasoning']}", now, r["url"]),
         )
-    conn.commit()
+    if remainder:
+        conn.commit()
 
     elapsed = time.time() - t0
-    log.info("Done: %d scored in %.1fs (%.1f jobs/sec)", len(results), elapsed, len(results) / elapsed if elapsed > 0 else 0)
+    scored_count = sum(1 for r in results if not r.get("_ineligible"))
+    log.info("Done: %d scored, %d skipped (ineligible) in %.1fs", scored_count, skipped, elapsed)
 
     # Score distribution
     dist = conn.execute("""
@@ -205,7 +255,7 @@ def run_scoring(limit: int = 0, rescore: bool = False) -> dict:
     distribution = [(row[0], row[1]) for row in dist]
 
     return {
-        "scored": len(results),
+        "scored": scored_count,
         "errors": errors,
         "elapsed": elapsed,
         "distribution": distribution,

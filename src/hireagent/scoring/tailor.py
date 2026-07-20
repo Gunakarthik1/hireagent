@@ -1362,13 +1362,13 @@ def _generate_summary_for_jd(profile: dict, job: dict) -> str:
     user = (
         f"ROLE: {job.get('title', '')} at {job.get('company', job.get('site', ''))}\n"
         f"TOP JD SKILLS: {(job.get('full_description', '') or '')[:400]}\n\n"
-        f"CANDIDATE: MS CS ASU (4.0 GPA, Dec 2025) | {exp_summary} | Projects: {proj_summary}\n"
+        f"CANDIDATE: MS CS Graduate ASU (4.0 GPA, graduated Dec 2025) | {exp_summary} | Projects: {proj_summary}\n"
         f"RELEVANT SKILLS: Python, FastAPI, Spring Boot, PostgreSQL, Docker, React, Claude API, Ollama\n\n"
-        "Write exactly 2 sentences (35 words max) starting with 'Accelerated Masters Student from ASU':"
+        "Write exactly 2 sentences (35 words max) starting with 'Recent MS CS Graduate from ASU':"
     )
 
     _FALLBACK_SUMMARY = (
-        "Accelerated Masters Student from ASU (4.0 GPA, Dec 2025) specializing in backend systems and LLM integration. "
+        "Recent MS CS Graduate from ASU (4.0 GPA, graduated Dec 2025) specializing in backend systems and LLM integration. "
         "Built production-grade pipelines at Velocity Tech and shipped HireAgent, an agentic job discovery platform."
     )
 
@@ -1398,9 +1398,10 @@ def _generate_summary_for_jd(profile: dict, job: dict) -> str:
 def run_tailoring(min_score: int = 7, limit: int = 20, validation_mode: str = "strict") -> dict:
     """Deterministic tailoring using fixed LaTeX template and local Ollama bullets."""
 
-    # Tailor ALL eligible (entry-level) jobs regardless of fit_score.
-    # min_score is kept for CLI compatibility but ignored - we want maximum coverage.
-    log.info("Tailoring ALL eligible jobs (min_score threshold disabled for maximum coverage).")
+    # Only tailor jobs that meet the score threshold — no point compiling LaTeX
+    # for jobs we'll never apply to.  min_score=0 disables the filter entirely.
+    effective_min = max(min_score, 5) if min_score > 0 else 0
+    log.info("Tailoring jobs with fit_score >= %d (min_score=%d).", effective_min, min_score)
 
     resolved_template_path = TEMPLATE_PATH.resolve()
     log.info("Base template validation: template=%s", resolved_template_path)
@@ -1411,7 +1412,7 @@ def run_tailoring(min_score: int = 7, limit: int = 20, validation_mode: str = "s
 
     conn = get_connection()
     candidate_limit = max(limit * 50, 200)
-    jobs = get_jobs_by_stage(conn=conn, stage="pending_tailor", min_score=0, limit=candidate_limit)
+    jobs = get_jobs_by_stage(conn=conn, stage="pending_tailor", min_score=effective_min, limit=candidate_limit)
     if not jobs:
         log.info("No untailored jobs available for tailoring.")
         return {"approved": 0, "failed": 0, "errors": 0, "elapsed": 0.0}
@@ -1791,6 +1792,10 @@ def run_tailoring(min_score: int = 7, limit: int = 20, validation_mode: str = "s
         if throttle > 0:
             time.sleep(throttle)
 
+        # Incremental commit every 5 jobs so progress survives kills/crashes
+        if idx % 5 == 0:
+            conn.commit()
+
     conn.commit()
     elapsed = time.time() - t0
     log.info("Tailoring done in %.1fs: %s", elapsed, stats)
@@ -1801,3 +1806,52 @@ def run_tailoring(min_score: int = 7, limit: int = 20, validation_mode: str = "s
         "fallback": stats.get("fallback", 0),
         "elapsed": elapsed,
     }
+
+
+def tailor_one_job(job_url: str) -> tuple[str | None, str]:
+    """Tailor a single job by URL. Used by the version manager.
+
+    Returns:
+        (pdf_path_str, resume_text) — pdf_path_str is None on failure.
+    """
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT url, title, site, location, full_description, fit_score "
+        "FROM jobs WHERE url = ?", (job_url,)
+    ).fetchone()
+    if not row:
+        return None, ""
+
+    job = dict(zip(["url", "title", "site", "location", "full_description", "fit_score"], row))
+
+    # If already tailored, return what's there
+    existing = conn.execute(
+        "SELECT tailored_resume_path FROM jobs WHERE url = ?", (job_url,)
+    ).fetchone()
+    if existing and existing[0] and Path(existing[0]).exists():
+        resume_text = ""
+        if MASTER_RESUME_TEXT.exists():
+            try:
+                resume_text = MASTER_RESUME_TEXT.read_text(encoding="utf-8")
+            except Exception:
+                pass
+        return existing[0], resume_text
+
+    # Run the full tailoring pipeline for just this one job.
+    # We temporarily force the job into 'pending_tailor' so run_tailoring picks it up.
+    run_tailoring(min_score=0, limit=1, validation_mode="normal")
+
+    # Re-read from DB
+    row2 = conn.execute(
+        "SELECT tailored_resume_path FROM jobs WHERE url = ?", (job_url,)
+    ).fetchone()
+    pdf_path = row2[0] if row2 else None
+
+    resume_text = ""
+    if MASTER_RESUME_TEXT.exists():
+        try:
+            resume_text = MASTER_RESUME_TEXT.read_text(encoding="utf-8")
+        except Exception:
+            pass
+
+    return pdf_path, resume_text

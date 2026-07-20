@@ -45,3 +45,23 @@ Thumbs.db
 
 # Claude Code
 .claude/
+
+# Editor / AI assistant configs (machine-specific)
+.cursor/
+.cursorrules
+.opencode.json
+.windsurfrules
+
+# Log files
+*.log
+apply_run.log
+session_export.md
+
+# Personal documents / scratch files
+Notion_AI_Engineer_*
+*.aux
+*.out
+entry_level_jobs_*.csv
+
+# Node (dashboard build artifacts already excluded via dist/ above)
+dashboard/node_modules/

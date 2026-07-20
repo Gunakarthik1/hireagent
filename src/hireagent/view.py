@@ -404,3 +404,418 @@ def open_dashboard(output_path: str | None = None) -> None:
     path = generate_dashboard(output_path)
     console.print("[dim]Opening in browser...[/dim]")
     webbrowser.open(f"file:///{path}")
+
+
+# ── Apply Queue Report ────────────────────────────────────────────────────────
+
+def generate_report(
+    output_path: str | None = None,
+    min_score: int = 7,
+    limit: int = 0,
+) -> str:
+    """Generate a focused apply-queue HTML report of top-scoring jobs.
+
+    Args:
+        output_path: Where to write the HTML file. Defaults to ~/.hireagent/report.html.
+        min_score: Minimum fit score to include (default 7).
+        limit: Max jobs to include (0 = all).
+
+    Returns:
+        Absolute path to the generated HTML file.
+    """
+    from html import escape
+
+    out = Path(output_path) if output_path else APP_DIR / "report.html"
+    conn = get_connection()
+
+    query = f"""
+        SELECT url, title, salary, location, site,
+               full_description, application_url,
+               fit_score, score_reasoning,
+               tailored_resume_path, apply_status
+        FROM jobs
+        WHERE fit_score >= {min_score}
+          AND application_url IS NOT NULL
+          AND (apply_status IS NULL OR apply_status NOT IN ('applied', 'skipped'))
+        ORDER BY fit_score DESC, title
+        {"LIMIT " + str(limit) if limit > 0 else ""}
+    """
+    rows = conn.execute(query).fetchall()
+    columns = [d[0] for d in conn.execute(query).description] if rows else []
+
+    # Normalise to dicts
+    if rows and not isinstance(rows[0], dict):
+        cols = [d[0] for d in conn.execute(
+            "SELECT url, title, salary, location, site, full_description, "
+            "application_url, fit_score, score_reasoning, tailored_resume_path, apply_status "
+            "FROM jobs LIMIT 0"
+        ).description]
+        rows = [dict(zip(cols, r)) for r in rows]
+
+    total_applied = conn.execute(
+        "SELECT COUNT(*) FROM jobs WHERE apply_status='applied'"
+    ).fetchone()[0]
+    total_ready = len(rows)
+
+    # Build job rows HTML
+    job_rows_html = ""
+    for i, j in enumerate(rows, 1):
+        score = j.get("fit_score") or 0
+        title = escape(j.get("title") or "Untitled")
+        site  = escape(j.get("site") or "")
+        loc   = escape(j.get("location") or "")
+        sal   = escape(j.get("salary") or "")
+        apply_url = escape(j.get("application_url") or "")
+        job_url   = escape(j.get("url") or "")
+        reasoning = escape((j.get("score_reasoning") or "").split("\n")[-1][:300])
+        resume_path = j.get("tailored_resume_path") or ""
+        has_resume  = bool(resume_path) and Path(resume_path).exists()
+
+        score_color = (
+            "#4ade80" if score >= 9 else
+            "#34d399" if score >= 8 else
+            "#60a5fa" if score >= 7 else
+            "#f59e0b"
+        )
+
+        resume_btn = ""
+        if has_resume:
+            resume_btn = f'<a class="btn btn-resume" href="file://{escape(resume_path)}" target="_blank">📄 Resume</a>'
+
+        job_rows_html += f"""
+        <tr class="job-row" data-score="{score}">
+          <td class="rank">#{i}</td>
+          <td>
+            <div class="score-badge" style="background:{score_color}">{score}</div>
+          </td>
+          <td>
+            <div class="job-title-cell">
+              <a class="job-title-link" href="{job_url}" target="_blank">{title}</a>
+              <div class="job-meta">{site} · {loc}{(" · " + sal) if sal else ""}</div>
+              {f'<div class="reasoning">{reasoning}</div>' if reasoning else ""}
+            </div>
+          </td>
+          <td class="actions-cell">
+            {resume_btn}
+            <a class="btn btn-apply" href="{apply_url}" target="_blank">Apply →</a>
+          </td>
+        </tr>"""
+
+    if not job_rows_html:
+        job_rows_html = """
+        <tr><td colspan="4" class="empty">
+          No jobs ready to apply. Run <code>hireagent run score tailor</code> first.
+        </td></tr>"""
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>HireAgent — Apply Queue</title>
+<style>
+  * {{ margin:0; padding:0; box-sizing:border-box; }}
+  body {{
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    background: #0f0f1a;
+    color: #e2e8f0;
+    min-height: 100vh;
+  }}
+
+  /* Header */
+  .topbar {{
+    background: linear-gradient(135deg, #1e1b4b, #0f172a);
+    border-bottom: 1px solid #2d2d4e;
+    padding: 20px 32px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 12px;
+  }}
+  .topbar-left {{ display: flex; align-items: center; gap: 14px; }}
+  .logo {{ font-size: 28px; }}
+  .brand h1 {{ font-size: 20px; font-weight: 800; color: #a5b4fc; }}
+  .brand p {{ font-size: 12px; color: #64748b; margin-top: 2px; }}
+
+  .stats-pills {{ display: flex; gap: 10px; flex-wrap: wrap; }}
+  .pill {{
+    background: #1e293b;
+    border: 1px solid #334155;
+    border-radius: 20px;
+    padding: 6px 16px;
+    font-size: 13px;
+    font-weight: 600;
+    display: flex; align-items: center; gap: 6px;
+  }}
+  .pill .num {{ color: #a5b4fc; font-size: 16px; }}
+  .pill.green {{ border-color: #4ade8044; }}
+  .pill.green .num {{ color: #4ade80; }}
+
+  /* Toolbar */
+  .toolbar {{
+    padding: 16px 32px;
+    background: #12122a;
+    border-bottom: 1px solid #1e293b;
+    display: flex;
+    gap: 12px;
+    align-items: center;
+    flex-wrap: wrap;
+  }}
+  .toolbar-label {{ font-size: 12px; color: #64748b; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; }}
+
+  .filter-btn {{
+    background: #1e293b;
+    border: 1px solid #334155;
+    color: #94a3b8;
+    padding: 6px 14px;
+    border-radius: 8px;
+    cursor: pointer;
+    font-size: 12px;
+    font-weight: 600;
+    transition: all 0.15s;
+  }}
+  .filter-btn:hover {{ background: #263548; color: #e2e8f0; }}
+  .filter-btn.active {{ background: #4f46e5; border-color: #4f46e5; color: #fff; }}
+
+  .search {{
+    background: #1e293b;
+    border: 1px solid #334155;
+    color: #e2e8f0;
+    padding: 7px 14px;
+    border-radius: 8px;
+    font-size: 13px;
+    width: 220px;
+    outline: none;
+    margin-left: auto;
+  }}
+  .search:focus {{ border-color: #4f46e5; }}
+  .search::placeholder {{ color: #475569; }}
+
+  /* Table */
+  .table-wrap {{ padding: 24px 32px; }}
+
+  .count-row {{
+    font-size: 12px;
+    color: #64748b;
+    margin-bottom: 12px;
+  }}
+
+  table {{
+    width: 100%;
+    border-collapse: collapse;
+  }}
+
+  thead th {{
+    text-align: left;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.7px;
+    color: #475569;
+    font-weight: 700;
+    padding: 10px 14px;
+    border-bottom: 1px solid #1e293b;
+  }}
+
+  .job-row {{
+    border-bottom: 1px solid #1a1a2e;
+    transition: background 0.1s;
+  }}
+  .job-row:hover {{ background: #16213e; }}
+
+  td {{ padding: 14px; vertical-align: top; }}
+
+  .rank {{ color: #334155; font-size: 12px; font-weight: 600; white-space: nowrap; }}
+
+  .score-badge {{
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 32px; height: 32px;
+    border-radius: 8px;
+    font-size: 14px;
+    font-weight: 800;
+    color: #0f0f1a;
+  }}
+
+  .job-title-cell {{ display: flex; flex-direction: column; gap: 4px; }}
+  .job-title-link {{
+    color: #e2e8f0;
+    text-decoration: none;
+    font-weight: 600;
+    font-size: 14px;
+    line-height: 1.3;
+  }}
+  .job-title-link:hover {{ color: #a5b4fc; }}
+
+  .job-meta {{ font-size: 12px; color: #64748b; }}
+  .reasoning {{ font-size: 11px; color: #475569; font-style: italic; line-height: 1.5; margin-top: 2px; max-width: 520px; }}
+
+  .actions-cell {{ white-space: nowrap; text-align: right; }}
+
+  .btn {{
+    display: inline-block;
+    padding: 7px 14px;
+    border-radius: 8px;
+    font-size: 12px;
+    font-weight: 700;
+    text-decoration: none;
+    cursor: pointer;
+    transition: all 0.15s;
+    margin-left: 6px;
+  }}
+
+  .btn-apply {{
+    background: linear-gradient(135deg, #4f46e5, #7c3aed);
+    color: #fff;
+    border: none;
+  }}
+  .btn-apply:hover {{
+    background: linear-gradient(135deg, #4338ca, #6d28d9);
+    transform: translateY(-1px);
+    box-shadow: 0 3px 10px rgba(79,70,229,0.4);
+  }}
+
+  .btn-resume {{
+    background: #1e293b;
+    color: #94a3b8;
+    border: 1px solid #334155;
+  }}
+  .btn-resume:hover {{ background: #263548; color: #e2e8f0; }}
+
+  .empty {{ text-align: center; padding: 48px; color: #64748b; font-size: 14px; }}
+
+  .hidden {{ display: none !important; }}
+
+  /* Extension CTA */
+  .ext-cta {{
+    margin: 0 32px 24px;
+    background: linear-gradient(135deg, #1e1b4b, #1a1a2e);
+    border: 1px solid #4f46e544;
+    border-radius: 12px;
+    padding: 16px 20px;
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    flex-wrap: wrap;
+  }}
+  .ext-cta-icon {{ font-size: 28px; }}
+  .ext-cta-text h3 {{ font-size: 14px; font-weight: 700; color: #a5b4fc; }}
+  .ext-cta-text p {{ font-size: 12px; color: #64748b; margin-top: 3px; }}
+  .ext-cta-btn {{
+    margin-left: auto;
+    background: linear-gradient(135deg, #4f46e5, #7c3aed);
+    color: #fff;
+    border: none;
+    padding: 8px 18px;
+    border-radius: 8px;
+    font-size: 12px;
+    font-weight: 700;
+    cursor: pointer;
+    text-decoration: none;
+  }}
+
+  @media (max-width: 768px) {{
+    .topbar, .toolbar, .table-wrap {{ padding: 16px; }}
+    .reasoning {{ display: none; }}
+    .search {{ width: 100%; margin-left: 0; }}
+  }}
+</style>
+</head>
+<body>
+
+<div class="topbar">
+  <div class="topbar-left">
+    <span class="logo">🎯</span>
+    <div class="brand">
+      <h1>Apply Queue</h1>
+      <p>HireAgent — Top jobs ready for manual application</p>
+    </div>
+  </div>
+  <div class="stats-pills">
+    <div class="pill green"><span class="num">{total_ready}</span> Ready to Apply</div>
+    <div class="pill"><span class="num">{total_applied}</span> Applied</div>
+    <div class="pill"><span class="num">{min_score}+</span> Min Score</div>
+  </div>
+</div>
+
+<div class="toolbar">
+  <span class="toolbar-label">Score Filter:</span>
+  <button class="filter-btn active" onclick="setFilter(0,this)">All {min_score}+</button>
+  <button class="filter-btn" onclick="setFilter(8,this)">8+ Strong</button>
+  <button class="filter-btn" onclick="setFilter(9,this)">9+ Excellent</button>
+  <input type="text" class="search" placeholder="Search title, company..." oninput="filterText(this.value)">
+</div>
+
+<div class="ext-cta">
+  <span class="ext-cta-icon">🤖</span>
+  <div class="ext-cta-text">
+    <h3>HireAgent Fill Chrome Extension</h3>
+    <p>Click "Apply →" on any job, then use the extension to auto-fill the form in seconds.</p>
+  </div>
+  <a class="ext-cta-btn" href="chrome://extensions" target="_blank">Open Extensions</a>
+</div>
+
+<div class="table-wrap">
+  <div class="count-row" id="countRow">{total_ready} jobs ready</div>
+  <table>
+    <thead>
+      <tr>
+        <th>#</th>
+        <th>Score</th>
+        <th>Job</th>
+        <th style="text-align:right">Actions</th>
+      </tr>
+    </thead>
+    <tbody id="jobTable">
+{job_rows_html}
+    </tbody>
+  </table>
+</div>
+
+<script>
+let minScore = 0;
+let searchText = '';
+
+function setFilter(min, btn) {{
+  minScore = min;
+  document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  applyFilters();
+}}
+
+function filterText(val) {{
+  searchText = val.toLowerCase();
+  applyFilters();
+}}
+
+function applyFilters() {{
+  let shown = 0, total = 0;
+  document.querySelectorAll('.job-row').forEach(row => {{
+    total++;
+    const score = parseInt(row.dataset.score) || 0;
+    const text  = row.textContent.toLowerCase();
+    const ok = score >= (minScore || {min_score}) && (!searchText || text.includes(searchText));
+    row.classList.toggle('hidden', !ok);
+    if (ok) shown++;
+  }});
+  document.getElementById('countRow').textContent = shown + ' of ' + total + ' jobs showing';
+}}
+applyFilters();
+</script>
+
+</body>
+</html>"""
+
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(html, encoding="utf-8")
+    abs_path = str(out.resolve())
+    console.print(f"[green]Report written → {abs_path}[/green]")
+    return abs_path
+
+
+def open_report(output_path: str | None = None, min_score: int = 7, limit: int = 0) -> None:
+    """Generate the apply-queue report and open it in the default browser."""
+    path = generate_report(output_path, min_score=min_score, limit=limit)
+    console.print("[dim]Opening in browser...[/dim]")
+    webbrowser.open(f"file:///{path}")

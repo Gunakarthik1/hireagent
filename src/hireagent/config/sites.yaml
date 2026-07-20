@@ -8,7 +8,6 @@
 # are flagged as "manual" during apply — bot skips, user applies by hand.
 manual_ats:
   - "ibegin.tcsapps.com"       # TCS iBegin — unsolvable CAPTCHA every time
-  - "myworkdayjobs.com"         # Workday — SPA skeleton loading blocks automation
 
 # ── Blocked sites — too problematic for automation ───────────────────────
 blocked:
@@ -24,6 +23,13 @@ blocked:
     - "%google.jobs%"
     - "%accenture%"
     - "%workopolis.com/out%"
+    - "%amazon.jobs%"
+    - "%jobs.gem.com%"
+    - "%apple.com/careers%"
+    - "%jobs.apple.com%"
+    - "%nvidia.com/en-us/about-nvidia/careers%"
+    - "%nvidia.wd5.myworkdayjobs.com%"
+    - "%nvidia.com/careers%"
 
 # ── Blocked SSO domains — cannot authenticate through these ──────────────
 blocked_sso:

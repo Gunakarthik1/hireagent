@@ -1,0 +1,406 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>HireAgent Fill — Settings</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background: #0f0f1a;
+      color: #e2e8f0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+      font-size: 14px;
+      min-height: 100vh;
+      padding: 0 0 40px;
+    }
+
+    .topbar {
+      background: linear-gradient(135deg, #1e1b4b, #0f172a);
+      border-bottom: 1px solid #2d2d4e;
+      padding: 18px 32px;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .topbar h1 {
+      font-size: 18px;
+      font-weight: 700;
+      color: #a5b4fc;
+    }
+
+    .topbar p {
+      font-size: 12px;
+      color: #64748b;
+      margin-top: 2px;
+    }
+
+    .container {
+      max-width: 640px;
+      margin: 32px auto;
+      padding: 0 24px;
+    }
+
+    .section {
+      background: #1a1a2e;
+      border: 1px solid #2d2d4e;
+      border-radius: 12px;
+      padding: 20px 24px;
+      margin-bottom: 20px;
+    }
+
+    .section h2 {
+      font-size: 13px;
+      font-weight: 700;
+      color: #a5b4fc;
+      text-transform: uppercase;
+      letter-spacing: 0.8px;
+      margin-bottom: 16px;
+      padding-bottom: 10px;
+      border-bottom: 1px solid #2d2d4e;
+    }
+
+    .field-row {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+      margin-bottom: 12px;
+    }
+
+    .field-row.single { grid-template-columns: 1fr; }
+
+    .field {
+      display: flex;
+      flex-direction: column;
+      gap: 5px;
+    }
+
+    label {
+      font-size: 11px;
+      font-weight: 600;
+      color: #94a3b8;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+
+    input, textarea {
+      background: #0f172a;
+      border: 1px solid #334155;
+      border-radius: 8px;
+      color: #e2e8f0;
+      font-size: 13px;
+      padding: 9px 12px;
+      outline: none;
+      transition: border-color 0.15s;
+      font-family: inherit;
+    }
+
+    input:focus, textarea:focus {
+      border-color: #4f46e5;
+      box-shadow: 0 0 0 2px rgba(79,70,229,0.2);
+    }
+
+    textarea {
+      resize: vertical;
+      min-height: 80px;
+      line-height: 1.5;
+    }
+
+    .hint {
+      font-size: 11px;
+      color: #475569;
+      margin-top: 3px;
+    }
+
+    .actions {
+      display: flex;
+      gap: 10px;
+      justify-content: flex-end;
+      margin-top: 24px;
+    }
+
+    .btn {
+      padding: 10px 20px;
+      border: none;
+      border-radius: 8px;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.15s;
+    }
+
+    .btn-primary {
+      background: linear-gradient(135deg, #4f46e5, #7c3aed);
+      color: #fff;
+    }
+
+    .btn-primary:hover {
+      background: linear-gradient(135deg, #4338ca, #6d28d9);
+      transform: translateY(-1px);
+    }
+
+    .btn-secondary {
+      background: #1e293b;
+      color: #94a3b8;
+      border: 1px solid #334155;
+    }
+
+    .btn-secondary:hover { background: #263548; }
+
+    .toast {
+      position: fixed;
+      bottom: 24px;
+      right: 24px;
+      background: #1e293b;
+      border: 1px solid #4ade80;
+      color: #4ade80;
+      padding: 12px 20px;
+      border-radius: 10px;
+      font-size: 13px;
+      font-weight: 600;
+      display: none;
+      box-shadow: 0 4px 20px rgba(0,0,0,0.4);
+    }
+
+    .toast.error {
+      border-color: #f87171;
+      color: #f87171;
+    }
+
+    .api-key-row {
+      display: flex;
+      gap: 8px;
+    }
+
+    .api-key-row input { flex: 1; }
+
+    .test-btn {
+      padding: 9px 14px;
+      background: #1e293b;
+      border: 1px solid #334155;
+      border-radius: 8px;
+      color: #94a3b8;
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+      white-space: nowrap;
+      transition: all 0.15s;
+    }
+    .test-btn:hover { background: #263548; color: #e2e8f0; }
+  </style>
+</head>
+<body>
+  <div class="topbar">
+    <span style="font-size:24px">🤖</span>
+    <div>
+      <h1>HireAgent Fill — Settings</h1>
+      <p>Your profile is stored locally and never sent to any server except the AI API.</p>
+    </div>
+  </div>
+
+  <div class="container">
+
+    <!-- Import -->
+    <div class="section" style="border-color:#4f46e544;background:linear-gradient(135deg,#1e1b4b22,#1a1a2e)">
+      <h2 style="color:#a5b4fc">Quick Import from HireAgent</h2>
+      <p style="font-size:12px;color:#64748b;margin-bottom:14px">
+        Run <code style="background:#0f172a;padding:2px 6px;border-radius:4px;color:#a5b4fc">hireagent export-profile</code>
+        in your terminal, then import the generated JSON file here.
+      </p>
+      <div style="display:flex;gap:10px;align-items:center">
+        <input type="file" id="importFile" accept=".json" style="display:none">
+        <button class="btn btn-primary" id="importBtn" style="padding:9px 18px">
+          📂 Import profile.json
+        </button>
+        <span style="font-size:11px;color:#475569" id="importStatus"></span>
+      </div>
+    </div>
+
+    <!-- API Key -->
+    <div class="section">
+      <h2>AI Configuration</h2>
+      <div class="field">
+        <label>NVIDIA NIM API Key</label>
+        <div class="api-key-row">
+          <input type="password" id="apiKey" placeholder="nvapi-..." autocomplete="off">
+          <button class="test-btn" id="testApiBtn">Test</button>
+        </div>
+        <span class="hint">Get your key at build.nvidia.com → API Keys</span>
+      </div>
+    </div>
+
+    <!-- Personal Info -->
+    <div class="section">
+      <h2>Personal Information</h2>
+      <div class="field-row">
+        <div class="field">
+          <label>First Name</label>
+          <input type="text" id="firstName" placeholder="Gunakarthik">
+        </div>
+        <div class="field">
+          <label>Last Name</label>
+          <input type="text" id="lastName" placeholder="Naidu Lanka">
+        </div>
+      </div>
+      <div class="field-row">
+        <div class="field">
+          <label>Email</label>
+          <input type="email" id="email" placeholder="you@email.com">
+        </div>
+        <div class="field">
+          <label>Phone</label>
+          <input type="tel" id="phone" placeholder="(480) 555-0100">
+        </div>
+      </div>
+      <div class="field-row">
+        <div class="field">
+          <label>LinkedIn URL</label>
+          <input type="url" id="linkedin" placeholder="https://linkedin.com/in/you">
+        </div>
+        <div class="field">
+          <label>GitHub URL</label>
+          <input type="url" id="github" placeholder="https://github.com/you">
+        </div>
+      </div>
+      <div class="field-row">
+        <div class="field">
+          <label>Website / Portfolio</label>
+          <input type="url" id="website" placeholder="https://yoursite.com">
+        </div>
+        <div class="field">
+          <label>Work Authorization</label>
+          <input type="text" id="workAuth" placeholder="OPT - no sponsorship needed">
+        </div>
+      </div>
+    </div>
+
+    <!-- Address -->
+    <div class="section">
+      <h2>Address</h2>
+      <div class="field-row single">
+        <div class="field">
+          <label>Street Address</label>
+          <input type="text" id="address" placeholder="123 Main St">
+        </div>
+      </div>
+      <div class="field-row">
+        <div class="field">
+          <label>City</label>
+          <input type="text" id="city" placeholder="Tempe">
+        </div>
+        <div class="field">
+          <label>State</label>
+          <input type="text" id="state" placeholder="AZ">
+        </div>
+      </div>
+      <div class="field-row">
+        <div class="field">
+          <label>Zip Code</label>
+          <input type="text" id="zip" placeholder="85281">
+        </div>
+        <div class="field">
+          <label>Country</label>
+          <input type="text" id="country" placeholder="United States">
+        </div>
+      </div>
+    </div>
+
+    <!-- Education -->
+    <div class="section">
+      <h2>Education</h2>
+      <div class="field-row">
+        <div class="field">
+          <label>University</label>
+          <input type="text" id="university" placeholder="Arizona State University">
+        </div>
+        <div class="field">
+          <label>Degree</label>
+          <input type="text" id="degree" placeholder="Master of Science">
+        </div>
+      </div>
+      <div class="field-row">
+        <div class="field">
+          <label>Major / Field of Study</label>
+          <input type="text" id="major" placeholder="Computer Science">
+        </div>
+        <div class="field">
+          <label>Graduation Year</label>
+          <input type="text" id="gradYear" placeholder="2025">
+        </div>
+      </div>
+      <div class="field-row">
+        <div class="field">
+          <label>GPA (optional)</label>
+          <input type="text" id="gpa" placeholder="4.0">
+        </div>
+      </div>
+    </div>
+
+    <!-- Work Experience -->
+    <div class="section">
+      <h2>Work Experience</h2>
+      <div class="field-row">
+        <div class="field">
+          <label>Most Recent Company</label>
+          <input type="text" id="currentCompany" placeholder="Velocity Tech">
+        </div>
+        <div class="field">
+          <label>Most Recent Title</label>
+          <input type="text" id="currentTitle" placeholder="Software Engineer Intern">
+        </div>
+      </div>
+      <div class="field-row">
+        <div class="field">
+          <label>Years of Experience</label>
+          <input type="text" id="yearsExp" placeholder="0-1">
+        </div>
+        <div class="field">
+          <label>Target Role</label>
+          <input type="text" id="targetRole" placeholder="Software Engineer">
+        </div>
+      </div>
+      <div class="field-row">
+        <div class="field">
+          <label>Target Salary (USD)</label>
+          <input type="text" id="targetSalary" placeholder="95000">
+        </div>
+      </div>
+      <div class="field-row single">
+        <div class="field">
+          <label>Skills (comma-separated)</label>
+          <input type="text" id="skills" placeholder="Python, Java, TypeScript, AWS, Docker, FastAPI, React">
+        </div>
+      </div>
+    </div>
+
+    <!-- EEO Defaults -->
+    <div class="section">
+      <h2>EEO / Demographic Defaults</h2>
+      <div class="field-row">
+        <div class="field">
+          <label>Gender (for EEO forms)</label>
+          <input type="text" id="gender" placeholder="Prefer not to say">
+        </div>
+        <div class="field">
+          <label>Race/Ethnicity (for EEO)</label>
+          <input type="text" id="race" placeholder="Prefer not to say">
+        </div>
+      </div>
+      <div class="hint" style="margin-top:8px">
+        Disability: always "No" &nbsp;|&nbsp; Veteran: always "Not a protected veteran" &nbsp;|&nbsp; Sponsorship: always "No"
+      </div>
+    </div>
+
+    <div class="actions">
+      <button class="btn btn-secondary" id="clearBtn">Clear All</button>
+      <button class="btn btn-primary" id="saveBtn">Save Profile</button>
+    </div>
+
+  </div>
+
+  <div class="toast" id="toast"></div>
+
+  <script src="settings.js"></script>
+</body>
+</html>

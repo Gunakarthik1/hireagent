@@ -191,10 +191,10 @@ def store_jobspy_results(conn: sqlite3.Connection, df, source_label: str,
 
         try:
             conn.execute(
-                "INSERT INTO jobs (url, title, salary, description, location, site, strategy, discovered_at, "
+                "INSERT INTO jobs (url, title, company, salary, description, location, site, strategy, discovered_at, "
                 "full_description, application_url, detail_scraped_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (url, title, salary, description, location_str, site_label, strategy, now,
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (url, title, company, salary, description, location_str, site_label, strategy, now,
                  full_description, apply_url, detail_scraped_at),
             )
             new += 1
@@ -325,7 +325,7 @@ def search_jobs(
 ) -> dict:
     """Run a single job search via JobSpy and store results in DB."""
     if sites is None:
-        sites = ["indeed", "linkedin", "zip_recruiter"]
+        sites = ["indeed", "zip_recruiter"]
 
     proxy_config = parse_proxy(proxy) if proxy else None
 
@@ -387,13 +387,14 @@ def _full_crawl(
     locations: list[str] | None = None,
     sites: list[str] | None = None,
     results_per_site: int = 100,
-    hours_old: int = 72,
     proxy: str | None = None,
     max_retries: int = 2,
+    limit: int = 0,
+    hours_old: int = 0,
 ) -> dict:
     """Run all search queries from search config across all locations."""
     if sites is None:
-        sites = ["indeed", "linkedin", "zip_recruiter"]
+        sites = ["indeed", "zip_recruiter"]
 
     # Build search combinations from config
     queries = search_cfg.get("queries", [])
@@ -401,6 +402,10 @@ def _full_crawl(
     defaults = search_cfg.get("defaults", {})
     glassdoor_map = search_cfg.get("glassdoor_location_map", {})
     accept_locs, reject_locs = _load_location_config(search_cfg)
+
+    # Use hours_old from parameter if provided (>0), else from config, else 72
+    if hours_old <= 0:
+        hours_old = search_cfg.get("defaults", {}).get("hours_old", 72)
 
     if tiers:
         queries = [q for q in queries if q.get("tier") in tiers]
@@ -445,6 +450,10 @@ def _full_crawl(
         total_existing += result["existing"]
         total_errors += result["errors"]
 
+        if limit > 0 and total_new >= limit:
+            log.info("Discovery limit reached (%d new jobs) — stopping full crawl", total_new)
+            break
+
         if completed % 5 == 0 or completed == len(searches):
             log.info("Progress: %d/%d queries done (%d new, %d dupes, %d errors)",
                      completed, len(searches), total_new, total_existing, total_errors)
@@ -467,7 +476,7 @@ def _full_crawl(
 
 # -- Public entry point ------------------------------------------------------
 
-def run_discovery(cfg: dict | None = None) -> dict:
+def run_discovery(cfg: dict | None = None, limit: int = 0, hours_old: int = 0) -> dict:
     """Main entry point for JobSpy-based job discovery.
 
     Loads search queries and locations from the user's search config YAML,
@@ -490,7 +499,6 @@ def run_discovery(cfg: dict | None = None) -> dict:
     proxy = cfg.get("proxy")
     sites = cfg.get("sites")
     results_per_site = cfg.get("defaults", {}).get("results_per_site", 100)
-    hours_old = cfg.get("defaults", {}).get("hours_old", 72)
     tiers = cfg.get("tiers")
     locations = cfg.get("location_labels")
 
@@ -500,6 +508,7 @@ def run_discovery(cfg: dict | None = None) -> dict:
         locations=locations,
         sites=sites,
         results_per_site=results_per_site,
-        hours_old=hours_old,
         proxy=proxy,
+        limit=limit,
+        hours_old=hours_old,
     )

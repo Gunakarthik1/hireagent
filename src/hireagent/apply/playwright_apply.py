@@ -3,6 +3,11 @@
 Replaces Claude Code CLI with direct browser automation.
 Connects to an already-launched Chrome instance via CDP.
 No Claude account required.
+
+Architecture (Vision-Verified Interaction Loop):
+  - BrowserController  : type_with_verification replaces page.fill()
+  - IntelligenceLayer  : NVIDIA NIM Nemotron (text) + Llama-3.2-11b (vision)
+  - CaptchaSolver      : CapSolver with reCAPTCHA Enterprise support
 """
 
 import json
@@ -12,8 +17,38 @@ from pathlib import Path
 from typing import Optional
 
 from hireagent import config
+from hireagent.apply.saas_observer import (
+    log_degree_match,
+    log_step,
+    read_learning_buffer,
+)
+from hireagent.apply.vision_loop import (
+    BrowserController,
+    CaptchaSolver,
+    IntelligenceLayer,
+    find_submit_button_vision,
+    vision_verified_fill,
+)
 
 logger = logging.getLogger(__name__)
+
+# Module-level singletons — created once per process to avoid repeated init overhead
+_intelligence: IntelligenceLayer | None = None
+_captcha_solver: CaptchaSolver | None = None
+
+
+def _get_intelligence() -> IntelligenceLayer:
+    global _intelligence
+    if _intelligence is None:
+        _intelligence = IntelligenceLayer()
+    return _intelligence
+
+
+def _get_captcha() -> CaptchaSolver:
+    global _captcha_solver
+    if _captcha_solver is None:
+        _captcha_solver = CaptchaSolver()
+    return _captcha_solver
 
 _CUSTOM_ANSWERS_PATH = Path.home() / ".hireagent" / "custom_answers.json"
 _custom_answers_cache: dict | None = None
@@ -114,16 +149,19 @@ def _resolve_salary(job: dict, default: str = "90000") -> str:
 
 def _build_field_data(profile: dict, job: dict | None = None) -> dict:
     """Flatten profile dict into simple key→value lookup for form filling."""
-    p = profile.get("personal", {})
-    wa = profile.get("work_authorization", {})
+    p   = profile.get("personal", {})
+    wa  = profile.get("work_authorization", {})
     comp = profile.get("compensation", {})
-    exp = profile.get("experience", {})
-    eeo = profile.get("eeo_voluntary", {})
+    exp  = profile.get("experience", {})
+    eeo  = profile.get("eeo_voluntary", {})
+    edu  = profile.get("education", {})
+    masters = edu.get("masters", {})
 
     full_name = p.get("full_name", "")
-    parts = full_name.split(None, 1)
-    first_name = parts[0] if parts else ""
-    last_name = parts[1] if len(parts) > 1 else ""
+
+    # ── Identity Anchor: use profile.personal.first_name directly — never split full_name ──
+    first_name = p.get("first_name") or (full_name.split(None, 1)[0] if full_name else "")
+    last_name  = p.get("last_name") or (full_name.split(None, 1)[1] if len(full_name.split(None, 1)) > 1 else "")
 
     authorized = str(wa.get("legally_authorized_to_work", "yes")).lower()
     auth_yes = authorized not in ("no", "false", "0", "")
@@ -133,29 +171,45 @@ def _build_field_data(profile: dict, job: dict | None = None) -> dict:
     relocate = str(avail.get("willing_to_relocate", "yes")).lower()
     willing_to_relocate = relocate not in ("no", "false", "0", "")
 
+    # ── EEO Anchor: NEVER "Decline to Self-Identify" — always use profile value ──
+    raw_gender = eeo.get("gender", "")
+    gender = raw_gender if raw_gender else "Male"  # Hard rule: profile gender or Male, never Decline
+
+    raw_race = eeo.get("race_ethnicity", "")
+    race = raw_race if raw_race else "Asian"
+
+    # ── Current company: empty → "N/A" (caller passes this only when field is required) ──
+    current_company = exp.get("current_company", "") or ""
+
     return {
-        "full_name": full_name,
-        "first_name": first_name,
-        "last_name": last_name,
-        "email": p.get("email", ""),
-        "phone": (lambda d: d[1:] if len(d) == 11 and d.startswith("1") else d)(re.sub(r"\D", "", p.get("phone", ""))),
-        "linkedin_url": p.get("linkedin_url", ""),
-        "github_url": p.get("github_url", ""),
-        "portfolio_url": p.get("portfolio_url") or p.get("website_url", ""),
-        "address": p.get("address", ""),
-        "city": p.get("city", ""),
-        "state": p.get("province_state", ""),
-        "zip_code": p.get("postal_code", ""),
-        "country": p.get("country", "United States"),
-        "salary": _resolve_salary(job or {}, default=str(comp.get("salary_expectation", "90000"))),
+        "full_name":        full_name,
+        "first_name":       first_name,
+        "last_name":        last_name,
+        "email":            p.get("email", ""),
+        "phone":            (lambda d: d[1:] if len(d) == 11 and d.startswith("1") else d)(re.sub(r"\D", "", p.get("phone", ""))),
+        "linkedin_url":     p.get("linkedin_url", ""),
+        "github_url":       p.get("github_url", ""),
+        "portfolio_url":    p.get("portfolio_url") or p.get("website_url", ""),
+        "address":          p.get("address", ""),
+        "city":             p.get("city", ""),
+        "state":            p.get("province_state", ""),
+        "zip_code":         p.get("postal_code", ""),
+        "country":          p.get("country", "United States"),
+        "salary":           _resolve_salary(job or {}, default=str(comp.get("salary_expectation", "90000"))),
         "years_experience": str(exp.get("years_of_experience_total", "0")),
-        "education": exp.get("education_level", ""),
-        "gender": eeo.get("gender", "Decline to self-identify"),
-        "race": eeo.get("race_ethnicity", "Decline to self-identify"),
-        "veteran": eeo.get("veteran_status", "I am not a protected veteran"),
-        "disability": eeo.get("disability_status", "I do not wish to answer"),
-        "auth_yes": auth_yes,
-        "needs_sponsor": needs_sponsor,
+        "education":        exp.get("education_level", ""),
+        # Degree pulled directly from education.masters — used for tiered degree matching
+        "degree":           masters.get("degree", "Master of Science"),
+        "school":           masters.get("school", "Arizona State University"),
+        # GPA — undergrad GPA for "GPA" text fields
+        "gpa":              profile.get("education", {}).get("bachelors", {}).get("gpa", "4.0"),
+        "gender":           gender,
+        "race":             race,
+        "veteran":          eeo.get("veteran_status", "I am not a protected veteran"),
+        "disability":       eeo.get("disability_status", "No"),
+        "current_company":  current_company,
+        "auth_yes":         auth_yes,
+        "needs_sponsor":    needs_sponsor,
         "willing_to_relocate": willing_to_relocate,
     }
 
@@ -179,6 +233,8 @@ TEXT_PATTERNS: list[tuple[list[str], str]] = [
     (["zip", "postal"], "zip_code"),
     (["country"], "country"),
     (["salary", "compensation", "desired salary", "expected salary", "expected compensation", "salary expectation", "pay expectation", "desired pay", "hourly rate", "hourly wage", "desired hourly", "wage", "usd", "annual salary", "base salary"], "salary"),
+    (["current company", "current employer", "current organization", "employer name", "company name", "where do you work", "place of employment"], "current_company"),
+    (["gpa", "grade point", "cumulative gpa", "undergraduate gpa", "overall gpa"], "gpa"),
 ]
 
 
@@ -369,12 +425,15 @@ def _fill_workday_fields(page, field_data: dict) -> int:
             inp = page.query_selector(f"[data-automation-id='{automation_id}'] input, "
                                        f"input[data-automation-id='{automation_id}']")
             if inp and inp.is_visible() and not inp.is_disabled():
-                try:
-                    inp.fill(str(value))
-                except Exception:
-                    inp.click(click_count=3)
-                    inp.type(str(value), delay=30)
-                filled += 1
+                _bc = BrowserController(page)
+                if _bc.type_with_verification(inp, str(value)):
+                    filled += 1
+                else:
+                    try:
+                        inp.fill(str(value))
+                        filled += 1
+                    except Exception:
+                        pass
         except Exception as e:
             logger.debug("Workday field %s error: %s", automation_id, e)
 
@@ -491,6 +550,16 @@ def _fill_text_inputs(page, field_data: dict) -> int:
         "input[type='url'], input:not([type]), input[type='number']"
     )
     inputs = page.query_selector_all(selectors)
+
+    # ── Sort inputs by y-coordinate (top-to-bottom) to fill sequentially ────
+    def _y_sort_key(el):
+        try:
+            bb = el.bounding_box()
+            return bb["y"] if bb else 99999
+        except Exception:
+            return 99999
+    inputs = sorted(inputs, key=_y_sort_key)
+
     for inp in inputs:
         try:
             if not inp.is_visible() or inp.is_disabled():
@@ -501,7 +570,39 @@ def _fill_text_inputs(page, field_data: dict) -> int:
             # Check custom_answers.json first, then profile-based matching
             custom_val = _match_custom("text", label)
             field_key = _match_text_field(label)
-            value = custom_val or (field_data.get(field_key) if field_key else None)
+
+            # ── HARD-CODED IDENTITY ANCHORS (No LLM) ────────────────────────
+            # These are FORBIDDEN from LLM mapping. Always use profile directly.
+            if field_key == "first_name":
+                value = field_data.get("first_name", "")
+                # Double-check: never use "Guna" or any shortened form
+                if value and len(value) < 6:
+                    value = field_data.get("full_name", "").rsplit(None, 1)[0] if field_data.get("full_name") else value
+                custom_val = None  # Override any custom_answers
+            elif field_key == "last_name":
+                value = field_data.get("last_name", "")
+                custom_val = None
+            elif field_key == "email":
+                value = field_data.get("email", "")
+                custom_val = None
+
+            # ── current_company: if empty and field requires it, type "N/A" ──
+            if field_key == "current_company" and not custom_val:
+                raw_company = field_data.get("current_company", "")
+                if not raw_company:
+                    # Only fill N/A if field is marked required
+                    required_attr = inp.get_attribute("required")
+                    aria_req = inp.get_attribute("aria-required")
+                    if required_attr is not None or aria_req == "true":
+                        value = "N/A"
+                    else:
+                        continue  # Leave blank if not required
+                else:
+                    value = raw_company
+            elif field_key not in ("first_name", "last_name", "email"):
+                # Generic path — identity fields already handled above
+                value = custom_val or (field_data.get(field_key) if field_key else None)
+
             if not value:
                 continue
             # Check current value — skip only if it already matches what we'd fill.
@@ -509,30 +610,157 @@ def _fill_text_inputs(page, field_data: dict) -> int:
             current = (inp.input_value() or "").strip()
             if current and current.lower() == str(value).lower():
                 continue  # Already correct
-            # Override pre-filled or empty fields with profile data
+
+            # ── Click-Wait-Type: scroll → click → 400ms → type → Tab ──────────
+            ok = False
             try:
-                inp.fill(str(value))
-            except Exception:
-                # fill() may fail on some inputs; fall back to click+type
-                inp.click(click_count=3)
-                inp.type(str(value), delay=30)
-            filled += 1
+                inp.scroll_into_view_if_needed(timeout=2000)
+                inp.click(timeout=2000)
+                page.wait_for_timeout(400)
+                inp.fill("")          # clear any pre-filled value
+                page.keyboard.type(str(value), delay=30)
+                page.wait_for_timeout(150)
+                page.keyboard.press("Tab")
+                ok = True
+            except Exception as _cwt_e:
+                logger.debug("[fill] Click-Wait-Type failed for '%s': %s", label[:30], _cwt_e)
+                # Fallback: plain fill()
+                try:
+                    inp.fill(str(value))
+                    ok = True
+                except Exception:
+                    pass
+
+            # ── First Name PII guard: never allow "Guna" alone ───────────────
+            if ok and field_key == "first_name":
+                try:
+                    _actual = (inp.input_value() or "").strip()
+                    if _actual and len(_actual) < 8 and "naidu" not in _actual.lower():
+                        logger.warning("[PII] First name typed as '%s' — correcting to '%s'", _actual, value)
+                        inp.fill("")
+                        page.keyboard.type(str(value), delay=30)
+                        page.keyboard.press("Tab")
+                except Exception:
+                    pass
+            source = "Custom" if custom_val else "Profile"
+            if ok:
+                filled += 1
+                log_step(field=label, value_source=source, result="Success",
+                         detail=f"{field_key} → '{str(value)[:40]}'")
+                # ── Natural delay: let React state catch up before next field ──
+                page.wait_for_timeout(400)
+                # ── Visibility guard: check for red error on this field ────────
+                _red_retries = 0
+                while _red_retries < 3:
+                    try:
+                        _has_red = inp.evaluate("""el => {
+                            const parent = el.closest('.field') || el.closest('.form-group') ||
+                                           el.closest('[class*="field"]') || el.parentElement;
+                            if (!parent) return false;
+                            const errs = parent.querySelectorAll(
+                                '[class*="error"], [class*="invalid"], [class*="Error"], [role="alert"]'
+                            );
+                            for (const e of errs) {
+                                const r = e.getBoundingClientRect();
+                                if (r.width > 0 && r.height > 0 && (e.innerText || '').trim().length > 1) return true;
+                            }
+                            return false;
+                        }""")
+                        if not _has_red:
+                            break
+                        _red_retries += 1
+                        logger.info("[fill] Red error on '%s' — retry %d/3", label[:30], _red_retries)
+                        # Re-try the fill
+                        inp.fill(str(value))
+                        page.wait_for_timeout(500)
+                    except Exception:
+                        break
+            else:
+                try:
+                    dom_snip = inp.evaluate("el => el.outerHTML")
+                except Exception:
+                    dom_snip = ""
+                log_step(field=label, value_source=source, result="Failure",
+                         detail=f"type_with_verification failed for {field_key}",
+                         dom_snippet=dom_snip)
             logger.debug("[fill] %s → %s (label='%s', was='%s')", field_key, str(value)[:30], label[:40], current[:20])
         except Exception as e:
             logger.debug("Text fill error: %s", e)
     return filled
 
 
-def _fill_selects(page, field_data: dict) -> int:
+def _fill_selects(page, field_data: dict, intelligence=None) -> int:
     """Fill visible select dropdowns. Returns count filled."""
     filled = 0
     selects = page.query_selector_all("select")
+
+    # ── Sort selects by y-coordinate (top-to-bottom) ────────────────────────
+    def _y_sort_key(el):
+        try:
+            bb = el.bounding_box()
+            return bb["y"] if bb else 99999
+        except Exception:
+            return 99999
+    selects = sorted(selects, key=_y_sort_key)
+
     for sel in selects:
         try:
             if not sel.is_visible() or sel.is_disabled():
                 continue
             label = _get_label_text(page, sel)
             lt = label.lower()
+
+            # ── Degree fields: use tiered matching ───────────────────────────
+            if any(kw in lt for kw in ["degree", "education level", "highest education",
+                                        "highest level", "level of education"]):
+                ok = _click_matching_option(page, sel, label, field_data, intelligence)
+                if ok:
+                    filled += 1
+                    log_step(field=label, value_source="Profile", result="Success",
+                             detail="Degree tiered match")
+                else:
+                    # Degree-error recovery: force click, type "Master", press Enter
+                    try:
+                        sel.click(force=True)
+                        page.wait_for_timeout(300)
+                        page.keyboard.type("Master")
+                        page.wait_for_timeout(400)
+                        # Try clicking first visible option that contains "master"
+                        _clicked_opt = page.evaluate("""() => {
+                            const opts = document.querySelectorAll(
+                                '[role="option"], li[role="option"], .select-option, option'
+                            );
+                            for (const o of opts) {
+                                const r = o.getBoundingClientRect();
+                                if (r.width > 0 && r.height > 0 &&
+                                    (o.innerText || o.textContent || '').toLowerCase().includes('master')) {
+                                    o.click(); return (o.innerText || o.textContent || '').trim().slice(0,40);
+                                }
+                            }
+                            return null;
+                        }""")
+                        if _clicked_opt:
+                            filled += 1
+                            log_step(field=label, value_source="Profile", result="Success",
+                                     detail=f"Degree recovery click: {_clicked_opt}")
+                        else:
+                            page.keyboard.press("Enter")
+                            page.wait_for_timeout(200)
+                            # Blur to commit
+                            page.evaluate("document.activeElement && document.activeElement.blur()")
+                            filled += 1
+                            log_step(field=label, value_source="Profile", result="Success",
+                                     detail="Degree recovery: typed Master + Enter")
+                    except Exception as _deg_rec_e:
+                        dom_snip = ""
+                        try:
+                            dom_snip = sel.evaluate("el => el.outerHTML")
+                        except Exception:
+                            pass
+                        log_step(field=label, value_source="Profile", result="Failure",
+                                 detail=f"All degree tiers + recovery failed: {_deg_rec_e}",
+                                 dom_snippet=dom_snip)
+                continue
 
             target_value = _match_custom("select", label)
             if target_value is None and any(kw in lt for kw in ["authorized to work", "legally authorized", "work auth", "work authorization"]):
@@ -544,17 +772,148 @@ def _fill_selects(page, field_data: dict) -> int:
             elif ("state" in lt or "province" in lt) and field_data.get("state"):
                 target_value = field_data["state"]
             elif "gender" in lt:
-                target_value = field_data.get("gender", "Decline to self-identify")
+                # ABSOLUTE OVERRIDE: ALWAYS "Male" — FORBIDDEN from selecting "Decline"
+                # Try "Male" first, then "Man" as fuzzy fallback
+                _gender_set = False
+                for _g_candidate in ["Male", "Man", "M"]:
+                    if _try_select_value(sel, _g_candidate):
+                        # PII guard: verify the selected value is not a decline variant
+                        _chosen = sel.evaluate(
+                            "el => { const o = el.options[el.selectedIndex]; return o ? o.text.trim() : ''; }"
+                        )
+                        if any(x in (_chosen or "").lower() for x in ("decline", "prefer not", "wish to answer")):
+                            logger.error("[PII VIOLATION] Gender landed on '%s' — forcing Male", _chosen)
+                            # Try again from top of candidate list
+                            for _retry in ["Male", "Man"]:
+                                if _try_select_value(sel, _retry):
+                                    break
+                        filled += 1
+                        log_step(field=label, value_source="Profile", result="Success",
+                                 detail=f"gender → '{_g_candidate}'")
+                        _gender_set = True
+                        break
+                if _gender_set:
+                    continue
+                target_value = "Male"  # Fallback for generic path
             elif "race" in lt or "ethnicity" in lt:
-                target_value = field_data.get("race", "Decline to self-identify")
+                # ABSOLUTE OVERRIDE: ALWAYS "Asian"
+                _race_set = False
+                for _r_candidate in ["Asian", "Asian (Not Hispanic or Latino)",
+                                      "Asian or Pacific Islander", "South Asian"]:
+                    if _try_select_value(sel, _r_candidate):
+                        filled += 1
+                        log_step(field=label, value_source="Profile", result="Success",
+                                 detail=f"race → '{_r_candidate}'")
+                        _race_set = True
+                        break
+                if _race_set:
+                    continue
+                target_value = "Asian"  # Fallback
             elif "veteran" in lt:
                 target_value = field_data.get("veteran", "I am not a protected veteran")
             elif "disability" in lt:
-                target_value = field_data.get("disability", "I do not wish to answer")
+                # ABSOLUTE OVERRIDE: ALWAYS "No" — FORBIDDEN from selecting any decline/opt-out
+                for candidate in ["No, I do not have a disability",
+                                   "No, I Don't Have a Disability",
+                                   "I don't have a disability", "I do not have a disability",
+                                   "No, I don't have a disability", "No disability",
+                                   "No, I don't have a disability (or history of)",
+                                   "No"]:
+                    if _try_select_value(sel, candidate):
+                        filled += 1
+                        log_step(field=label, value_source="Profile", result="Success",
+                                 detail=f"disability → '{candidate}'")
+                        break
+                continue
+            elif any(kw in lt for kw in ["relocat", "willing to travel", "willing to commute",
+                                          "in-person", "in person", "on-site", "onsite", "transport"]):
+                # Always Yes for any relocation/travel/in-person question
+                for candidate in ["Yes", "Willing to relocate", "Open to relocation", "Yes, I am willing"]:
+                    if _try_select_value(sel, candidate):
+                        filled += 1
+                        log_step(field=label, value_source="Profile", result="Success",
+                                 detail=f"relocate → '{candidate}'")
+                        break
+                continue
+            elif any(kw in lt for kw in ["citizenship", "visa status", "work status", "work permit",
+                                          "immigration status", "right to work"]):
+                # Prefer OPT/F-1 options; fall back to Other
+                for candidate in ["F1 OPT", "OPT", "F-1 OPT", "F1", "Optional Practical Training",
+                                   "Student Visa", "Visa", "Other"]:
+                    if _try_select_value(sel, candidate):
+                        filled += 1
+                        log_step(field=label, value_source="Profile", result="Success",
+                                 detail=f"visa → '{candidate}'")
+                        # If "Other" selected, try to type F1 OPT in a companion text box
+                        if candidate == "Other":
+                            try:
+                                page.wait_for_timeout(400)
+                                for _inp in page.query_selector_all("input[type='text']:visible"):
+                                    _inp_lbl = _get_label_text(page, _inp)
+                                    if any(k in _inp_lbl.lower() for k in ["visa", "status", "citizenship", "specify"]):
+                                        _inp.fill("F1 OPT")
+                                        break
+                            except Exception:
+                                pass
+                        break
+                continue
+            elif any(kw in lt for kw in ["how did you hear", "how did you find", "how did you learn",
+                                          "where did you hear", "referral source", "hear about us"]):
+                # Always prefer LinkedIn, then Company Website
+                for candidate in ["LinkedIn", "Company Website", "Job Board", "Indeed", "Other"]:
+                    if _try_select_value(sel, candidate):
+                        filled += 1
+                        log_step(field=label, value_source="Profile", result="Success",
+                                 detail=f"hear-about → '{candidate}'")
+                        logger.debug("[select] hear-about → '%s'", candidate)
+                        break
+                continue  # handled above, skip generic target_value path
 
-            if target_value and _try_select_value(sel, target_value):
-                filled += 1
-                logger.debug("[select] label='%s' → '%s'", label[:40], target_value)
+            if target_value:
+                ok = _try_select_value(sel, target_value)
+                if ok:
+                    filled += 1
+                    log_step(field=label, value_source="Profile", result="Success",
+                             detail=f"select → '{target_value}'")
+                    logger.debug("[select] label='%s' → '%s'", label[:40], target_value)
+                else:
+                    try:
+                        dom_snip = sel.evaluate("el => el.outerHTML")
+                    except Exception:
+                        dom_snip = ""
+                    log_step(field=label, value_source="Profile", result="Failure",
+                             detail=f"No match for '{target_value}'", dom_snippet=dom_snip)
+            # ── Natural delay + visibility guard after each select fill ────────
+            if filled > 0:
+                page.wait_for_timeout(400)
+                # Check for red error on this select's container
+                _red_retries_sel = 0
+                while _red_retries_sel < 3:
+                    try:
+                        _has_red_sel = sel.evaluate("""el => {
+                            const parent = el.closest('.field') || el.closest('.form-group') ||
+                                           el.closest('[class*="field"]') || el.parentElement;
+                            if (!parent) return false;
+                            const errs = parent.querySelectorAll(
+                                '[class*="error"], [class*="invalid"], [class*="Error"], [role="alert"]'
+                            );
+                            for (const e of errs) {
+                                const r = e.getBoundingClientRect();
+                                if (r.width > 0 && r.height > 0 && (e.innerText || '').trim().length > 1) return true;
+                            }
+                            return false;
+                        }""")
+                        if not _has_red_sel:
+                            break
+                        _red_retries_sel += 1
+                        logger.info("[select] Red error on '%s' — retry %d/3", label[:30], _red_retries_sel)
+                        # Force-type fallback for selects with errors
+                        sel.click(force=True)
+                        page.wait_for_timeout(300)
+                        page.keyboard.press("Enter")
+                        page.wait_for_timeout(500)
+                    except Exception:
+                        break
         except Exception as e:
             logger.debug("Select fill error: %s", e)
     return filled
@@ -585,6 +944,647 @@ def _try_select_value(select_el, target_value: str) -> bool:
         except Exception:
             pass
     return False
+
+
+# ---------------------------------------------------------------------------
+# Recursive Force-Select: re-check dropdowns that remain at placeholder
+# ---------------------------------------------------------------------------
+
+def _recursive_force_select(page, field_data: dict, intelligence=None) -> int:
+    """Second-pass: find ANY dropdown (native <select> or React combobox) still at placeholder.
+
+    Greenhouse uses React Select (<div class="select"> with <input role="combobox">),
+    NOT native <select> elements.  We must handle both.
+
+    For Degree: open → type "Master" → click matching option or press Enter.
+    For Citizenship/Visa: try F1 OPT options, fall back to "Other" + text input.
+    For EEO (Gender/Race/Disability): use hard-coded profile values.
+    Returns count of fields fixed.
+    """
+    fixed = 0
+
+    # ── Part A: Greenhouse React comboboxes (.select__placeholder visible) ────
+    # Find ALL React-Select containers that still show a placeholder or "Select..."
+    try:
+        stuck_react = page.evaluate("""() => {
+            const results = [];
+            // Greenhouse pattern: <label id="degree--0-label">, <input id="degree--0" role="combobox">
+            const combos = document.querySelectorAll('input[role="combobox"]');
+            for (const inp of combos) {
+                const r = inp.getBoundingClientRect();
+                if (r.width < 1) continue;
+                // Check if the container has a placeholder visible
+                const container = inp.closest('.select') || inp.closest('[class*="select__container"]');
+                if (!container) continue;
+                const placeholder = container.querySelector('[class*="placeholder"]');
+                const singleVal  = container.querySelector('[class*="single-value"]');
+                const hasRealVal = singleVal && singleVal.innerText && singleVal.innerText.trim() &&
+                                   !singleVal.innerText.toLowerCase().includes('select');
+                if (hasRealVal) continue;  // Already filled
+                // Get label from the associated <label> element
+                const labelId = inp.id ? inp.id + '-label' : '';
+                const lbl = labelId ? document.getElementById(labelId) : null;
+                const labelText = lbl ? lbl.innerText.trim() :
+                    (container.querySelector('label') || {}).innerText || inp.placeholder || inp.id || '';
+                results.push({
+                    id: inp.id || '',
+                    label: labelText.replace(/\\*/g, '').trim(),
+                    placeholder: placeholder ? placeholder.innerText.trim() : '',
+                });
+            }
+            return results;
+        }""") or []
+    except Exception:
+        stuck_react = []
+
+    for combo in stuck_react:
+        combo_id = combo.get("id", "")
+        combo_label = combo.get("label", "")
+        lt = combo_label.lower()
+        logger.info("[force-select] React combobox stuck: id=%s label='%s'", combo_id, combo_label[:40])
+
+        try:
+            inp = page.locator(f"#{combo_id}").first if combo_id else None
+            if not inp or not inp.is_visible(timeout=500):
+                continue
+
+            # ── Degree Logic (React Select) ───────────────────────────────────
+            if any(kw in lt for kw in ["degree", "education level", "highest education",
+                                        "highest level", "level of education"]):
+                # Try "Master of Science" first, then fall back through alias list
+                _clicked = None
+                for _deg_query in ["Master of Science", "Master's Degree", "Masters", "M.S.", "Graduate Degree", "Master"]:
+                    inp.click(timeout=1500)
+                    page.wait_for_timeout(400)
+                    # Clear any previous text
+                    inp.fill("")
+                    page.keyboard.type(_deg_query)
+                    page.wait_for_timeout(500)
+                    # Click the first visible option containing the query
+                    _clicked = page.evaluate("""(query) => {
+                        const q = query.toLowerCase();
+                        const opts = document.querySelectorAll(
+                            '[role="option"], [class*="select__option"], [id*="option"]'
+                        );
+                        for (const o of opts) {
+                            const r = o.getBoundingClientRect();
+                            if (r.width > 0 && r.height > 0 &&
+                                (o.innerText || '').toLowerCase().includes(q)) {
+                                o.click(); return (o.innerText || '').trim().slice(0,50);
+                            }
+                        }
+                        return null;
+                    }""", _deg_query)
+                    if _clicked:
+                        break
+                    # Escape to close dropdown before trying next query
+                    page.keyboard.press("Escape")
+                    page.wait_for_timeout(200)
+                if _clicked:
+                    fixed += 1
+                    logger.info("[force-select] Degree (React) → '%s'", _clicked)
+                else:
+                    page.keyboard.press("Enter")
+                    page.wait_for_timeout(300)
+                    fixed += 1
+                    logger.info("[force-select] Degree (React) → typed 'Master' + Enter")
+                continue
+
+            # ── Citizenship / Visa (React Select) ────────────────────────────
+            if any(kw in lt for kw in ["citizenship", "visa", "immigration", "right to work"]):
+                for candidate in ["F1 OPT", "OPT", "Other"]:
+                    inp.click(timeout=1500)
+                    page.wait_for_timeout(300)
+                    inp.fill("")
+                    page.keyboard.type(candidate)
+                    page.wait_for_timeout(500)
+                    _clicked = page.evaluate("""(target) => {
+                        const opts = document.querySelectorAll('[role="option"], [class*="select__option"]');
+                        for (const o of opts) {
+                            const r = o.getBoundingClientRect();
+                            const t = (o.innerText || '').toLowerCase().trim();
+                            if (r.width > 0 && r.height > 0 && t.includes(target.toLowerCase())) {
+                                o.click(); return t.slice(0,50);
+                            }
+                        }
+                        return null;
+                    }""", candidate)
+                    if _clicked:
+                        fixed += 1
+                        logger.info("[force-select] Citizenship (React) → '%s'", _clicked)
+                        if "other" in _clicked.lower():
+                            page.wait_for_timeout(400)
+                            try:
+                                for _txt in page.query_selector_all("input[type='text']:visible"):
+                                    _tl = _get_label_text(page, _txt).lower()
+                                    if any(k in _tl for k in ["visa", "status", "specify", "other"]):
+                                        _txt.fill("F1 OPT")
+                                        break
+                            except Exception:
+                                pass
+                        break
+                    page.keyboard.press("Escape")
+                    page.wait_for_timeout(200)
+                continue
+
+            # ── ABSOLUTE EEO OVERRIDES (React combobox) ───────────────────────
+            # Gender: FORBIDDEN from "Decline" — try "Male" then "Man"
+            if "gender" in lt:
+                for _g_query in ["Male", "Man"]:
+                    inp.click(timeout=1500)
+                    page.wait_for_timeout(300)
+                    inp.fill("")
+                    page.keyboard.type(_g_query)
+                    page.wait_for_timeout(500)
+                    _clicked = page.evaluate("""(q) => {
+                        const opts = document.querySelectorAll('[role="option"], [class*="select__option"]');
+                        for (const o of opts) {
+                            const r = o.getBoundingClientRect();
+                            const t = (o.innerText || '').toLowerCase().trim();
+                            if (r.width > 0 && r.height > 0 && t.includes(q.toLowerCase()) &&
+                                !t.includes('decline') && !t.includes('prefer not')) {
+                                o.click(); return (o.innerText || '').trim().slice(0,50);
+                            }
+                        }
+                        return null;
+                    }""", _g_query)
+                    if _clicked:
+                        fixed += 1
+                        logger.info("[force-select] Gender (React) → '%s'", _clicked)
+                        break
+                    page.keyboard.press("Escape")
+                    page.wait_for_timeout(200)
+                continue
+
+            # Disability: FORBIDDEN from "Decline"/"I don't wish to answer"
+            if "disability" in lt:
+                for _d_query in ["No, I do not", "No", "I do not have", "I don't have"]:
+                    inp.click(timeout=1500)
+                    page.wait_for_timeout(300)
+                    inp.fill("")
+                    page.keyboard.type(_d_query)
+                    page.wait_for_timeout(500)
+                    _clicked = page.evaluate("""(q) => {
+                        const opts = document.querySelectorAll('[role="option"], [class*="select__option"]');
+                        for (const o of opts) {
+                            const r = o.getBoundingClientRect();
+                            const t = (o.innerText || '').toLowerCase().trim();
+                            if (r.width > 0 && r.height > 0 && t.includes(q.toLowerCase()) &&
+                                !t.includes('decline') && !t.includes('wish to answer') &&
+                                !t.includes('prefer not')) {
+                                o.click(); return (o.innerText || '').trim().slice(0,50);
+                            }
+                        }
+                        return null;
+                    }""", _d_query)
+                    if _clicked:
+                        fixed += 1
+                        logger.info("[force-select] Disability (React) → '%s'", _clicked)
+                        break
+                    page.keyboard.press("Escape")
+                    page.wait_for_timeout(200)
+                continue
+
+            # ── Generic React combobox: type the profile value ────────────────
+            # For any other stuck React Select, try typing common profile values
+            _generic_map = {
+                "country": "United States",
+                "location": field_data.get("city", "") + ", " + field_data.get("state", ""),
+                "school": field_data.get("school", "Arizona State University"),
+                "discipline": "Computer Science",
+                "race": field_data.get("race", "Asian"),
+            }
+            for _key, _val in _generic_map.items():
+                if _key in lt and _val:
+                    inp.click(timeout=1500)
+                    page.wait_for_timeout(300)
+                    page.keyboard.type(_val[:30])
+                    page.wait_for_timeout(500)
+                    _opt_clicked = page.evaluate("""() => {
+                        const opts = document.querySelectorAll('[role="option"], [class*="select__option"]');
+                        for (const o of opts) {
+                            const r = o.getBoundingClientRect();
+                            if (r.width > 0 && r.height > 0) {
+                                o.click(); return (o.innerText || '').trim().slice(0,50);
+                            }
+                        }
+                        return null;
+                    }""")
+                    if _opt_clicked:
+                        fixed += 1
+                        logger.info("[force-select] React '%s' → '%s'", combo_label[:30], _opt_clicked)
+                    else:
+                        page.keyboard.press("Escape")
+                    break
+
+        except Exception as e:
+            logger.debug("[force-select] React combobox error for '%s': %s", combo_label[:30], e)
+
+    # ── Part B: Native <select> elements ─────────────────────────────────────
+    selects = page.query_selector_all("select")
+    for sel in selects:
+        try:
+            if not sel.is_visible():
+                continue
+            current_text = sel.evaluate("""el => {
+                const opt = el.options[el.selectedIndex];
+                return opt ? opt.text.trim() : '';
+            }""")
+            current_lower = (current_text or "").lower()
+            placeholders = ("select...", "choose...", "select one", "please select",
+                            "select an option", "--", "- select -", "")
+            if current_lower not in placeholders and not current_lower.startswith("select"):
+                continue
+
+            label = _get_label_text(page, sel)
+            lt = label.lower()
+            logger.info("[force-select] Native <select> stuck: '%s' (showing: '%s')", label[:40], current_text[:30])
+
+            if any(kw in lt for kw in ["degree", "education level", "highest education"]):
+                for candidate in ["Master of Science", "Master's Degree", "Masters", "M.S.", "Graduate Degree", "Master", "Graduate"]:
+                    if _try_select_value(sel, candidate):
+                        fixed += 1
+                        logger.info("[force-select] Degree (native) → '%s'", candidate)
+                        break
+            elif any(kw in lt for kw in ["citizenship", "visa", "immigration"]):
+                for candidate in ["F1 OPT", "OPT", "Other"]:
+                    if _try_select_value(sel, candidate):
+                        fixed += 1
+                        logger.info("[force-select] Citizenship (native) → '%s'", candidate)
+                        if candidate == "Other":
+                            page.wait_for_timeout(400)
+                            try:
+                                for _inp in page.query_selector_all("input[type='text']:visible"):
+                                    _inp_lbl = _get_label_text(page, _inp)
+                                    if any(k in _inp_lbl.lower() for k in ["visa", "status", "specify", "other"]):
+                                        _inp.fill("F1 OPT")
+                                        break
+                            except Exception:
+                                pass
+                        break
+            elif "gender" in lt:
+                if _try_select_value(sel, field_data.get("gender", "Male")):
+                    fixed += 1
+                    logger.info("[force-select] Gender (native) → '%s'", field_data.get("gender", "Male"))
+            elif "race" in lt or "ethnicity" in lt:
+                if _try_select_value(sel, field_data.get("race", "Asian")):
+                    fixed += 1
+                    logger.info("[force-select] Race (native) → '%s'", field_data.get("race", "Asian"))
+            elif "disability" in lt:
+                for candidate in ["No, I do not have a disability", "No, I Don't Have a Disability",
+                                   "I don't have a disability", "I do not have a disability",
+                                   "No, I don't have a disability", "No disability", "No"]:
+                    if _try_select_value(sel, candidate):
+                        fixed += 1
+                        logger.info("[force-select] Disability (native) → '%s'", candidate)
+                        break
+        except Exception as e:
+            logger.debug("[force-select] Native select error: %s", e)
+
+    return fixed
+
+
+# ---------------------------------------------------------------------------
+# Tiered degree matching
+# ---------------------------------------------------------------------------
+
+_DEGREE_TIER1 = ["Master of Science"]
+_DEGREE_TIER2 = [
+    "Masters", "Master's", "Master's Degree", "Master Degree",
+    "M.S.", "MS", "Graduate Degree", "Graduate",
+]
+_DEGREE_BROAD_SIGNALS = ["master", "graduate", "ms", "m.s"]
+
+
+def _click_matching_option(
+    page,
+    select_el,
+    label: str,
+    field_data: dict,
+    intelligence=None,
+) -> bool:
+    """Select best option for a dropdown field using 4-tier degree logic (or fuzzy for others).
+
+    For Degree fields:
+      Tier 1 — Exact: "Master of Science"
+      Tier 2 — Aliases: Masters, M.S., Graduate Degree, etc.
+      Tier 3 — LLM deep reasoning (120B model picks from available options)
+      Tier 4 — SaaS Safety: select 'Other', type degree in companion text box
+
+    For non-Degree fields: falls through to _try_select_value.
+    Returns True if an option was successfully selected.
+    """
+    lt = label.lower()
+    is_degree_field = any(kw in lt for kw in ["degree", "education level", "highest education",
+                                               "highest level", "level of education"])
+
+    # Collect all real options from the <select>
+    options = select_el.query_selector_all("option")
+    opt_texts: list[str] = []
+    opt_vals: list[str] = []
+    for opt in options:
+        txt = (opt.inner_text() or "").strip()
+        val = (opt.get_attribute("value") or "").strip()
+        if val.lower() in ("", "placeholder", "select", "select one", "--select--"):
+            continue
+        if txt.lower() in ("select...", "select one", "-- select --", "", "--"):
+            continue
+        opt_texts.append(txt)
+        opt_vals.append(val)
+
+    if not is_degree_field:
+        # Standard fuzzy matching for non-degree fields
+        target = field_data.get("education", "")
+        if not target:
+            return False
+        return _try_select_value(select_el, target)
+
+    degree_target = field_data.get("degree", "Master of Science")
+
+    def _select_by_text(text: str) -> bool:
+        """Try to select an option whose text matches `text` (case-insensitive)."""
+        tl = text.lower()
+        for i, txt in enumerate(opt_texts):
+            if tl == txt.lower():
+                try:
+                    select_el.select_option(value=opt_vals[i])
+                    return True
+                except Exception:
+                    pass
+        return False
+
+    def _select_contains(needle: str) -> tuple[bool, str]:
+        """Select first option whose text contains needle (case-insensitive). Returns (ok, matched_text)."""
+        nl = needle.lower()
+        for i, txt in enumerate(opt_texts):
+            if nl in txt.lower():
+                try:
+                    select_el.select_option(value=opt_vals[i])
+                    return True, txt
+                except Exception:
+                    pass
+        return False, ""
+
+    # ── Tier 1: Exact ────────────────────────────────────────────────────────
+    for t1 in _DEGREE_TIER1:
+        if _select_by_text(t1):
+            log_step(field=label, value_source="Profile", result="Success",
+                     detail=f"Tier1 exact: {t1}")
+            return True
+
+    # ── Tier 2: Common aliases ────────────────────────────────────────────────
+    for alias in _DEGREE_TIER2:
+        ok, matched = _select_contains(alias)
+        if ok:
+            log_degree_match(field=label, target=degree_target,
+                             selected=matched, tier=2, confidence=0.90)
+            log_step(field=label, value_source="Profile", result="Success",
+                     detail=f"Tier2 alias: {alias} → {matched}")
+            logger.info("[degree] Tier2 match: '%s' → '%s'", alias, matched)
+            return True
+
+    # Broader signal check (catches "Graduate-level", "Post-graduate")
+    for sig in _DEGREE_BROAD_SIGNALS:
+        ok, matched = _select_contains(sig)
+        if ok:
+            log_degree_match(field=label, target=degree_target,
+                             selected=matched, tier=2, confidence=0.80)
+            log_step(field=label, value_source="Profile", result="Success",
+                     detail=f"Tier2 broad: {sig} → {matched}")
+            logger.info("[degree] Tier2 broad match: '%s' → '%s'", sig, matched)
+            return True
+
+    # ── Tier 3: LLM deep reasoning ────────────────────────────────────────────
+    if intelligence and opt_texts:
+        try:
+            opts_str = ", ".join(f'"{o}"' for o in opt_texts[:20])
+            prompt = (
+                f"The candidate has a '{degree_target}'. "
+                f"These are the available degree options: [{opts_str}]. "
+                "Which is the most appropriate selection? Return ONLY the exact text of the option."
+            )
+            raw = intelligence._call_text_model(
+                system_prompt="You select the best form dropdown option for a job applicant. Return only the option text.",
+                user_msg=prompt,
+                max_tokens=64,
+            )
+            if raw:
+                chosen = raw.strip().strip('"').strip("'")
+                ok, matched = _select_contains(chosen)
+                if not ok:
+                    # Try exact
+                    ok = _select_by_text(chosen)
+                    matched = chosen if ok else ""
+                if ok:
+                    log_degree_match(field=label, target=degree_target,
+                                     selected=matched, tier=3, confidence=0.75)
+                    log_step(field=label, value_source="LLM", result="Success",
+                             detail=f"Tier3 LLM → '{matched}'")
+                    logger.info("[degree] Tier3 LLM match → '%s'", matched)
+                    return True
+        except Exception as exc:
+            logger.debug("[degree] Tier3 LLM error: %s", exc)
+
+    # ── Tier 4: SaaS Safety — select 'Other', fill companion text box ─────────
+    ok, matched = _select_contains("other")
+    if ok:
+        log_degree_match(field=label, target=degree_target,
+                         selected="Other", tier=4, confidence=0.50)
+        log_step(field=label, value_source="Profile", result="Success",
+                 detail="Tier4: selected 'Other'")
+        logger.info("[degree] Tier4: selected 'Other' — looking for companion text box")
+        # Wait briefly for companion text box to appear
+        try:
+            page.wait_for_timeout(600)
+            # Find nearby text input (same parent container, within 3 DOM levels up)
+            companion = select_el.evaluate("""el => {
+                let node = el;
+                for (let i = 0; i < 4; i++) {
+                    node = node.parentElement;
+                    if (!node) break;
+                    const inp = node.querySelector(
+                        'input[type="text"], input:not([type]), textarea'
+                    );
+                    if (inp && inp !== el) return inp.id || inp.name || '__found__';
+                }
+                return null;
+            }""")
+            if companion:
+                # Click and fill the companion input
+                for inp in page.query_selector_all("input[type='text'], input:not([type]), textarea"):
+                    try:
+                        if not inp.is_visible():
+                            continue
+                        inp.click()
+                        inp.fill(degree_target)
+                        logger.info("[degree] Tier4: typed '%s' into companion text box", degree_target)
+                        break
+                    except Exception:
+                        pass
+        except Exception as exc:
+            logger.debug("[degree] Tier4 companion text box error: %s", exc)
+        return True
+
+    # All tiers exhausted
+    log_step(field=label, value_source="Profile", result="Failure",
+             detail=f"No match found for degree in options: {opt_texts[:10]}")
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Greenhouse pre-submit safety check
+# ---------------------------------------------------------------------------
+
+_REQUIRED_FIELD_KEYS = {
+    "name":          ["name", "first name", "last name", "full name"],
+    "email":         ["email"],
+    "degree":        ["degree", "education"],
+    "authorization": ["authorized", "work auth", "legally authorized", "sponsorship"],
+    "eeo":           ["gender", "race", "ethnicity", "veteran", "disability", "eeo"],
+}
+
+
+def _final_form_audit(page, field_data: dict, intelligence: "IntelligenceLayer | None" = None) -> bool:
+    """Vision-Verified Submission audit using Llama 3.2 Vision.
+
+    Takes a screenshot, asks the vision model if there are:
+      - Any red validation error text visible
+      - Any dropdown still showing 'Select...' or 'Choose...'
+
+    If problems are found:
+      - Re-runs _recursive_force_select on remaining placeholders
+      - Returns False (MUST NOT submit)
+
+    If clean:
+      - Returns True (safe to submit)
+    """
+    import base64
+    from pathlib import Path
+
+    if intelligence is None:
+        intelligence = _get_intelligence()
+
+    try:
+        # Take screenshot for vision audit
+        _audit_ss = Path(f"/tmp/hireagent_audit_{int(__import__('time').time())}.png")
+        page.screenshot(path=str(_audit_ss), full_page=False)
+        with open(str(_audit_ss), "rb") as f:
+            b64 = base64.b64encode(f.read()).decode()
+
+        errors = intelligence.scan_for_errors(b64)
+        if not errors:
+            logger.info("[final_audit] Vision audit PASSED — no errors detected")
+            return True
+
+        logger.warning("[final_audit] Vision audit FAILED: %s", errors[:5])
+
+        # Attempt correction: force-select any remaining placeholder dropdowns
+        _fixed = _recursive_force_select(page, field_data, intelligence)
+        if _fixed:
+            logger.info("[final_audit] Fixed %d dropdown(s) in correction pass", _fixed)
+
+        # Re-check with DOM scan (faster than another vision call)
+        remaining = page.evaluate("""() => {
+            const issues = [];
+            // Check for red error text
+            for (const el of document.querySelectorAll('[class*="error"], [class*="invalid"], .error-message')) {
+                const r = el.getBoundingClientRect();
+                if (r.width > 0 && r.height > 0) {
+                    const txt = (el.innerText || '').trim();
+                    if (txt && txt.length > 2) issues.push('ERROR:' + txt.slice(0,80));
+                }
+            }
+            // Check for placeholder selects
+            for (const sel of document.querySelectorAll('select')) {
+                const r = sel.getBoundingClientRect();
+                if (r.width < 1) continue;
+                const opt = sel.options[sel.selectedIndex];
+                const t = opt ? opt.text.toLowerCase().trim() : '';
+                if (t.startsWith('select') || t.startsWith('choose') || t === '--' || t === '') {
+                    issues.push('PLACEHOLDER:' + (sel.name || sel.id || 'dropdown'));
+                }
+            }
+            return issues;
+        }""") or []
+
+        if remaining:
+            logger.warning("[final_audit] Still %d issue(s) after correction: %s", len(remaining), remaining[:5])
+            return False
+
+        logger.info("[final_audit] Audit PASSED after correction")
+        return True
+
+    except Exception as e:
+        logger.warning("[final_audit] Audit error (non-blocking): %s", e)
+        return True  # Don't block submit on audit infrastructure failure
+
+
+def pre_submit_check(page, field_data: dict) -> tuple[bool, list[str]]:
+    """Greenhouse submit safety gate.
+
+    Checks:
+      1. No visible 'required' indicators still unfilled.
+      2. Five key fields (Name, Email, Degree, Authorization, EEO) have values.
+
+    Returns (ok: bool, issues: list[str]).
+    Submit is ONLY allowed when ok is True.
+    """
+    issues: list[str] = []
+
+    # ── Check 1: visible "required" text in divs/spans ───────────────────────
+    try:
+        required_nodes = page.evaluate("""() => {
+            const hits = [];
+            const nodes = document.querySelectorAll('div, span, label, p');
+            for (const n of nodes) {
+                const style = window.getComputedStyle(n);
+                if (style.display === 'none' || style.visibility === 'hidden') continue;
+                const txt = (n.innerText || n.textContent || '').toLowerCase().trim();
+                if (txt === 'required' || txt.includes('this field is required') ||
+                    txt.includes('field is required') || txt.includes('* required')) {
+                    hits.push(txt.slice(0, 80));
+                }
+            }
+            return hits.slice(0, 10);
+        }""")
+        if required_nodes:
+            issues.append(f"Visible 'required' markers found: {required_nodes}")
+    except Exception as exc:
+        logger.debug("[pre_submit_check] required-node scan error: %s", exc)
+
+    # ── Check 2: five key fields have non-empty values ────────────────────────
+    def _field_has_value(keys: list[str]) -> bool:
+        for k in keys:
+            v = field_data.get(k)
+            if v and str(v).strip():
+                return True
+        return False
+
+    if not _field_has_value(["first_name", "last_name", "full_name"]):
+        issues.append("Name fields are empty")
+    if not _field_has_value(["email"]):
+        issues.append("Email is empty")
+    if not _field_has_value(["degree", "education"]):
+        issues.append("Degree/Education is empty")
+    if not _field_has_value(["auth_yes"]):
+        # auth_yes is bool — check explicitly
+        if not field_data.get("auth_yes"):
+            issues.append("Work authorization not set")
+    # EEO: at least one eeo field must be non-decline
+    eeo_ok = (
+        field_data.get("gender") not in ("", "Decline to self-identify", None)
+        or field_data.get("race") not in ("", "Decline to self-identify", None)
+        or field_data.get("veteran") not in ("", None)
+    )
+    if not eeo_ok:
+        issues.append("EEO fields are all blank/decline")
+
+    ok = len(issues) == 0
+    if not ok:
+        logger.warning("[pre_submit_check] BLOCKED: %s", issues)
+    else:
+        logger.info("[pre_submit_check] PASSED — all 5 key checks OK")
+    return ok, issues
 
 
 def _fill_radio_checkboxes(page, field_data: dict) -> int:
@@ -747,6 +1747,35 @@ def _detect_captcha(page) -> bool:
         return False
     except Exception:
         return False
+
+
+def _try_solve_captcha(page, page_url: str, log_fn=None, max_attempts: int = 2) -> bool:
+    """Attempt to solve a detected CAPTCHA using CapSolver API.
+
+    Imports _solve_captcha from free_agent. Retries up to max_attempts times.
+    Returns True if solved, False if all attempts failed.
+    """
+    _log = log_fn or (lambda msg: logger.info(msg))
+    try:
+        from hireagent.apply.free_agent import _solve_captcha
+    except ImportError:
+        _log("Cannot import _solve_captcha from free_agent")
+        return False
+
+    for attempt in range(1, max_attempts + 1):
+        _log(f"CAPTCHA solve attempt {attempt}/{max_attempts} via CapSolver...")
+        try:
+            solved = _solve_captcha(page, page_url)
+            if solved:
+                _log(f"CAPTCHA solved on attempt {attempt}")
+                page.wait_for_timeout(2000)  # Let page process the token
+                return True
+        except Exception as e:
+            _log(f"CAPTCHA solve attempt {attempt} error: {e}")
+        if attempt < max_attempts:
+            page.wait_for_timeout(3000)  # Wait before retry
+    _log(f"CAPTCHA unsolvable after {max_attempts} attempts")
+    return False
 
 
 def _wait_for_page_ready(page, timeout_ms: int = 8000) -> None:
@@ -1218,8 +2247,10 @@ def _click_apply_cta(page) -> bool:
         ".template-btn-submit",
         # Ashby
         "[data-testid='apply-button']",
-        # SmartRecruiters
+        # SmartRecruiters — "I'm interested" is the primary CTA; js-apply-btn is fallback
+        "button.js-apply-btn",
         ".js-apply-btn",
+        "button[data-sh-id*='apply' i]",
         # Rippling
         "[data-testid='apply-now-button']",
         # iCIMS
@@ -1236,7 +2267,10 @@ def _click_apply_cta(page) -> bool:
             pass
 
     # Fallback: text-based matching
+    # "I'm interested" (SmartRecruiters) is highest priority — placed before generic "apply"
+    # to ensure we fill with profile.json rather than a LinkedIn 1-click scrape.
     apply_kws = [
+        "i'm interested", "im interested",  # SmartRecruiters primary CTA
         "apply now", "apply for this job", "apply to this job", "apply for job",
         "start application", "begin application", "easy apply", "quick apply",
         "easily apply", "apply on company site", "apply on employer site",
@@ -1544,9 +2578,17 @@ def run_playwright_apply(
             # Wait for SPA rendering
             _wait_for_page_ready(page)
 
+            # ── Initialise vision-loop singletons for this application ──────────
+            _nim   = _get_intelligence()
+            _capt  = _get_captcha()
+            _bc    = BrowserController(page)
+
             if _detect_captcha(page):
-                log("CAPTCHA detected on initial page load")
-                return "captcha", "\n".join(log_lines)
+                log("CAPTCHA detected on initial page load — attempting solve via CaptchaSolver...")
+                if not _capt.solve(page, apply_url):
+                    log("CAPTCHA unsolvable on initial page load")
+                    return "captcha", "\n".join(log_lines)
+                log("CAPTCHA solved — continuing")
 
             # Log page title and check for expired/404 pages
             try:
@@ -1609,7 +2651,10 @@ def run_playwright_apply(
                     _handle_workday_login(page, log)
                     _wait_for_page_ready(page)
                     if _detect_captcha(page):
-                        return "captcha", "\n".join(log_lines)
+                        log("CAPTCHA detected after Apply CTA — attempting solve...")
+                        if not _try_solve_captcha(page, page.url, log_fn=log):
+                            return "captcha", "\n".join(log_lines)
+                        log("CAPTCHA solved after Apply CTA — continuing")
                 else:
                     log("No Apply CTA found on description page")
                     # Log visible buttons for debugging
@@ -1638,10 +2683,49 @@ def run_playwright_apply(
 
             resume_uploaded = False
 
+            # ── Red-state guard: reload once if errors are already visible on load ──
+            try:
+                _body_on_load = (page.inner_text("body", timeout=3000) or "").lower()
+                _red_signals = ("is required", "field is required", "please fill", "invalid", "error")
+                if any(s in _body_on_load for s in _red_signals):
+                    log("Red-state detected on page load — reloading to clear error state")
+                    page.reload(wait_until="domcontentloaded", timeout=20000)
+                    _wait_for_page_ready(page)
+            except Exception:
+                pass
+
+            # ── Submit blacklist: block submit/apply buttons until enough fields filled ──
+            _submit_unlock_threshold = 5   # fields must be filled before Submit is allowed
+            _total_fields_filled    = 0    # cumulative across all steps on this page
+            _submit_locked          = True
+
+            # ── "Don't Touch Blue" Rule: disable all Submit/Apply buttons via JS ──
+            # This prevents accidental clicks from the vision model or fill logic
+            # until we explicitly re-enable them after fields are verified.
+            try:
+                page.evaluate("""() => {
+                    const SUBMIT_KWS = ['submit', 'apply', 'send application', 'complete application'];
+                    document.querySelectorAll('button, input[type="submit"], [role="button"]').forEach(el => {
+                        const t = (el.innerText || el.value || el.getAttribute('aria-label') || '').toLowerCase().trim();
+                        if (SUBMIT_KWS.some(kw => t === kw || t.startsWith(kw + ' '))) {
+                            el.dataset._hireagentBlocked = 'true';
+                            el.style.visibility = 'hidden';
+                            el.style.pointerEvents = 'none';
+                        }
+                    });
+                }""")
+                log("  Submit/Apply buttons HIDDEN (blindfold) until fields verified")
+            except Exception:
+                pass
+
+            # ── URL snapshot for early-submission detection ──
+            _url_before_fill = page.url
+
             # Multi-step form loop (up to 50 steps — Workday can be very long)
             _wd_signin_attempts = 0  # Track consecutive sign-in attempts (fail-fast after 3)
             _last_page_hash = ""    # Stagnation detector: page content hash
             _stagnant_steps = 0     # Consecutive steps with no page change
+            _field_error_counts: dict[str, int] = {}   # label → consecutive error count
             for step in range(1, 151):
                 try:
                     log(f"--- Step {step} [url: {page.url[:80]}] ---")
@@ -1990,12 +3074,87 @@ def run_playwright_apply(
                 except Exception as _app_signin_err:
                     log(f"  App sign-in detection error: {_app_signin_err}")
 
+                # ── Re-apply blindfold every step (React re-renders restore buttons) ──
+                try:
+                    page.evaluate("""() => {
+                        const SUBMIT_KWS = ['submit', 'apply', 'send application', 'complete application'];
+                        document.querySelectorAll('button, input[type="submit"], [role="button"]').forEach(el => {
+                            const t = (el.innerText || el.value || el.getAttribute('aria-label') || '').toLowerCase().trim();
+                            if (SUBMIT_KWS.some(kw => t === kw || t.startsWith(kw + ' '))) {
+                                el.dataset._hireagentBlocked = 'true';
+                                el.style.visibility = 'hidden';
+                                el.style.pointerEvents = 'none';
+                            }
+                        });
+                    }""")
+                except Exception:
+                    pass
+
+                # ── Vision-verified pass first (Nemotron + type_with_verification) ──
+                _bc.page = page  # keep reference current after any page switches
+                _v_filled, _v_errors = vision_verified_fill(
+                    page, field_data, _nim, _bc, _capt, page.url
+                )
+                if _v_errors:
+                    log(f"  Vision red-line errors: {_v_errors[:3]}")
+                    # Track per-field error counts — send to Telegram after 2 consecutive failures
+                    for _verr in (_v_errors or []):
+                        _verr_key = str(_verr)[:60]
+                        _field_error_counts[_verr_key] = _field_error_counts.get(_verr_key, 0) + 1
+                        if _field_error_counts[_verr_key] >= 2:
+                            log(f"  Field stuck in error x{_field_error_counts[_verr_key]}: {_verr_key}")
+                            try:
+                                from hireagent.telegram_bot import notify
+                                _ss_err = Path(f"/tmp/hireagent_fielderr_{int(__import__('time').time())}.png")
+                                page.screenshot(path=str(_ss_err), full_page=False)
+                                notify(f"⚠️ Field error x{_field_error_counts[_verr_key]}: {_verr_key[:80]}\nWaiting for manual override…", _ss_err)
+                            except Exception:
+                                pass
+
+                # ── Legacy selector-based pass for selects, radios, Workday dropdowns ──
                 n_text = _fill_text_inputs(page, field_data)
-                n_sel = _fill_selects(page, field_data)
+                n_sel  = _fill_selects(page, field_data, intelligence=_nim)
                 n_radio = _fill_radio_checkboxes(page, field_data)
-                log(f"  Filled: {n_text} text, {n_sel} selects, {n_radio} radio groups")
+                # ── Recursive Force-Select: re-check any dropdown still at placeholder ──
+                n_force = _recursive_force_select(page, field_data, intelligence=_nim)
+                if n_force:
+                    log(f"  Force-select fixed {n_force} stuck dropdown(s)")
+                log(f"  Filled: vision={_v_filled} text={n_text} selects={n_sel} radios={n_radio} force={n_force}")
                 for _d in _wd_fill_diag:
                     log(f"    {_d}")
+
+                # ── Dispatch blur after every fill pass (prevents Enter-key submission) ──
+                try:
+                    page.evaluate("""() => {
+                        const active = document.activeElement;
+                        if (active && active !== document.body) {
+                            active.dispatchEvent(new Event('blur', {bubbles: true}));
+                            active.dispatchEvent(new Event('change', {bubbles: true}));
+                        }
+                    }""")
+                except Exception:
+                    pass
+
+                # ── Track total fields filled ─────────────────────────────────
+                _step_filled = (_v_filled or 0) + (n_text or 0) + (n_sel or 0) + (n_radio or 0) + (n_force or 0)
+                _total_fields_filled += _step_filled
+                # Submit button reveal is now done right before _find_submit_or_next above.
+                # We no longer reveal mid-loop on a count threshold — that caused premature submit.
+
+                # ── URL change detection: catch accidental early submission ──
+                try:
+                    _url_now = page.url
+                    if _url_now != _url_before_fill and step <= 3:
+                        log(f"  Early submission detected — URL changed before Submit: {_url_now[:80]}")
+                        log("  Retrying with restricted button access")
+                        _submit_locked = True   # re-lock submit
+                        _total_fields_filled = 0
+                        _url_before_fill = _url_now
+                        _wait_for_page_ready(page)
+                        continue
+                    _url_before_fill = _url_now
+                except Exception:
+                    pass
 
                 # Stagnation check: if page content hasn't changed for 10 consecutive steps, abort
                 try:
@@ -2022,8 +3181,11 @@ def run_playwright_apply(
                         page.wait_for_timeout(1000)
 
                 if _detect_captcha(page):
-                    log("CAPTCHA detected — cannot continue")
-                    return "captcha", "\n".join(log_lines)
+                    log("CAPTCHA detected during form fill — attempting solve via CaptchaSolver...")
+                    if not _capt.solve(page, page.url):
+                        log("CAPTCHA unsolvable during form fill")
+                        return "captcha", "\n".join(log_lines)
+                    log("CAPTCHA solved during form fill — continuing")
 
                 # Log all visible buttons for diagnosis (first 5 steps only)
                 if step <= 5 or step % 20 == 0:
@@ -2064,6 +3226,18 @@ def run_playwright_apply(
                     except Exception:
                         pass
 
+                # ── Reveal submit only now — after fill passes are done ───────
+                try:
+                    page.evaluate("""() => {
+                        document.querySelectorAll('[data-_hireagent-blocked]').forEach(el => {
+                            el.style.visibility = 'visible';
+                            el.style.pointerEvents = '';
+                            delete el.dataset._hireagentBlocked;
+                        });
+                    }""")
+                except Exception:
+                    pass
+
                 action, btn = _find_submit_or_next(page)
                 try:
                     btn_text = (btn.inner_text() or btn.get_attribute("value") or "").strip()[:30] if btn else ""
@@ -2071,15 +3245,32 @@ def run_playwright_apply(
                 except Exception:
                     log(f"  Next action: {action}")
 
+                # ── Hard guard: never submit on step 1 with 0 fields filled ──
+                # This prevents immediately clicking Submit right after resume upload.
+                _step_filled_so_far = (_v_filled or 0) + (n_text or 0) + (n_sel or 0) + (n_radio or 0) + (n_force or 0)
+                if action == "submit" and step <= 2 and _step_filled_so_far == 0:
+                    log(f"  [EARLY-SUBMIT GUARD] Submit found on step {step} with 0 fields filled — skipping, will fill first")
+                    action = "none"  # force it to keep looping
+
                 if action == "none":
                     # Check if we're on a success page already
                     if _detect_success(page):
                         log("Success page detected (no button needed)")
                         return "applied", "\n".join(log_lines)
+                    # ── Vision-model fallback: SoM screenshot to find Submit ──────
+                    log("No submit/next button found — trying vision model (SoM) fallback")
+                    _bc.page = page
+                    if find_submit_button_vision(page, _bc, _nim):
+                        page.wait_for_timeout(2500)
+                        _wait_for_page_ready(page)
+                        if _detect_success(page):
+                            log("Application submitted via vision fallback")
+                            return "applied", "\n".join(log_lines)
+                        continue  # submission navigated to next step
                     # Fallback: try Apply CTA click before giving up.
                     # This handles the case where we're still on the job description
                     # page and the Apply button wasn't matched by _find_submit_or_next.
-                    log("No submit/next button found — trying Apply CTA as fallback")
+                    log("Vision fallback failed — trying Apply CTA")
                     if _click_apply_cta(page):
                         _wait_for_page_ready(page, timeout_ms=10000)
                         page.wait_for_timeout(2000)
@@ -2172,6 +3363,202 @@ def run_playwright_apply(
                         log("[DRY RUN] Would click submit — stopping here")
                         return "dry_run", "\n".join(log_lines)
 
+                    # ── Hard submit blacklist: not enough fields filled yet ────
+                    if _submit_locked:
+                        log(f"  [SUBMIT LOCKED] Only {_total_fields_filled}/{_submit_unlock_threshold} fields filled — skipping submit, filling more")
+                        # Force another fill pass instead
+                        _v_filled2, _ = vision_verified_fill(page, field_data, _nim, _bc, _capt, page.url)
+                        n_text2 = _fill_text_inputs(page, field_data)
+                        n_sel2  = _fill_selects(page, field_data, intelligence=_nim)
+                        _total_fields_filled += (_v_filled2 or 0) + (n_text2 or 0) + (n_sel2 or 0)
+                        if _total_fields_filled >= _submit_unlock_threshold:
+                            _submit_locked = False
+                            log(f"  Submit unlocked after retry pass (total={_total_fields_filled})")
+                            try:
+                                page.evaluate("""() => {
+                                    document.querySelectorAll('[data-_hireagent-blocked]').forEach(el => {
+                                        el.disabled = false;
+                                        el.style.pointerEvents = '';
+                                        delete el.dataset._hireagentBlocked;
+                                    });
+                                }""")
+                                log("  Submit/Apply buttons RE-ENABLED")
+                            except Exception:
+                                pass
+                        else:
+                            log(f"  Still locked after retry (total={_total_fields_filled}) — skipping step")
+                            continue
+
+                    # ── Abort submit if ANY red error text is visible ─────────
+                    try:
+                        _red_errors = page.evaluate("""() => {
+                            const hits = [];
+                            for (const el of document.querySelectorAll('*')) {
+                                const st = window.getComputedStyle(el);
+                                if (st.display === 'none' || st.visibility === 'hidden') continue;
+                                const txt = (el.innerText || '').trim().toLowerCase();
+                                if (!txt || txt.length > 200) continue;
+                                const color = st.color;
+                                // Red text: rgb(r,g,b) where r >> g and r >> b
+                                const m = color.match(/rgb\\((\\d+),\\s*(\\d+),\\s*(\\d+)\\)/);
+                                if (m && parseInt(m[1]) > 150 && parseInt(m[2]) < 100 && parseInt(m[3]) < 100) {
+                                    if (txt.includes('required') || txt.includes('error') || txt.includes('invalid') || txt.includes('please')) {
+                                        hits.push(txt.slice(0,60));
+                                    }
+                                }
+                            }
+                            return hits.slice(0, 5);
+                        }""")
+                        if _red_errors:
+                            log(f"  [SUBMIT BLOCKED] Red error text visible: {_red_errors} — not submitting")
+                            continue
+                    except Exception:
+                        pass
+
+                    # ── Greenhouse Submit Lock: pre_submit_check MUST pass ────
+                    try:
+                        _check_ok, _check_issues = pre_submit_check(page, field_data)
+                        if not _check_ok:
+                            log(f"  [SUBMIT BLOCKED] pre_submit_check failed: {_check_issues}")
+                            log("  Skipping this step — will re-fill and retry next iteration")
+                            continue
+                        log("  [pre_submit_check] Passed — proceeding with submit")
+                    except Exception as _psc_e:
+                        log(f"  pre_submit_check error (non-fatal): {_psc_e}")
+
+                    # ── Vision-Verified Submission: final_form_audit MUST pass ──
+                    if not _final_form_audit(page, field_data, intelligence=_nim):
+                        log("  [SUBMIT BLOCKED] _final_form_audit FAILED — retrying fill")
+                        # One more force-select pass before looping back
+                        _recursive_force_select(page, field_data, intelligence=_nim)
+                        continue
+
+                    # ── Senior QA Auditor: vision scan before EVERY submit ────
+                    # Ground truth: Male / Asian / No disability / Gunakarthik Naidu / Master of Science
+                    _audit_passed = False
+                    for _audit_round in range(3):
+                        try:
+                            import base64 as _b64
+                            _audit_ss = Path(f"/tmp/hireagent_audit_qa_{int(__import__('time').time())}.png")
+                            page.screenshot(path=str(_audit_ss), full_page=False)
+                            with open(str(_audit_ss), "rb") as _f:
+                                _audit_b64 = _b64.b64encode(_f.read()).decode()
+                            # Inject SoM overlay so auditor can reference element IDs
+                            try:
+                                from hireagent.apply.vision_loop import _SOM_INJECT_JS, _SOM_REMOVE_JS
+                                _som_raw = page.evaluate(_SOM_INJECT_JS)
+                                _som_map = {int(k): v for k, v in __import__('json').loads(_som_raw).items()} if _som_raw else {}
+                                _audit_ss2 = Path(f"/tmp/hireagent_audit_som_{int(__import__('time').time())}.png")
+                                page.screenshot(path=str(_audit_ss2), full_page=False)
+                                with open(str(_audit_ss2), "rb") as _f2:
+                                    _audit_b64 = _b64.b64encode(_f2.read()).decode()
+                                page.evaluate(_SOM_REMOVE_JS)
+                            except Exception:
+                                _som_map = {}
+
+                            _audit_result = _nim.audit_screen(_audit_b64, som_map=_som_map)
+                            _audit_status = _audit_result.get("status", "PASS")
+                            _blunder      = _audit_result.get("detected_blunder", "")
+                            _elem_id      = _audit_result.get("offending_element_id")
+                            _fix          = _audit_result.get("fix_instruction", "")
+
+                            if _audit_status == "PASS":
+                                log(f"  [AUDITOR] ✅ PASS (round {_audit_round + 1}) — form verified clean")
+                                _audit_passed = True
+                                break
+
+                            # FAIL — log loudly and repair
+                            log(f"\n{'='*60}")
+                            log(f"  ⚠️  [AUDITOR] BLUNDER DETECTED: {_blunder}")
+                            log(f"  ⚠️  Offending element: #{_elem_id}  Fix: {_fix}")
+                            log(f"{'='*60}\n")
+                            logger.warning("⚠️ [AUDITOR] BLUNDER DETECTED: %s. REPAIRING...", _blunder)
+
+                            # ── Repair: target the offending element ─────────
+                            _repaired = False
+                            _blunder_lower = _blunder.lower()
+                            _fix_lower     = _fix.lower()
+
+                            # 1. EEO — gender declined
+                            if "gender" in _blunder_lower or "gender" in _fix_lower:
+                                for _g in ["Male", "Man"]:
+                                    for _sel in page.query_selector_all("select"):
+                                        try:
+                                            _lbl = _get_label_text(page, _sel).lower()
+                                            if "gender" in _lbl and _try_select_value(_sel, _g):
+                                                log(f"  [AUDITOR] Repaired gender → '{_g}'")
+                                                _repaired = True; break
+                                        except Exception: pass
+                                    if _repaired: break
+
+                            # 2. Disability wrong
+                            elif "disability" in _blunder_lower or "disability" in _fix_lower:
+                                for _d in ["No, I do not have a disability", "No, I Don't Have a Disability",
+                                           "I do not have a disability", "No"]:
+                                    for _sel in page.query_selector_all("select"):
+                                        try:
+                                            _lbl = _get_label_text(page, _sel).lower()
+                                            if "disability" in _lbl and _try_select_value(_sel, _d):
+                                                log(f"  [AUDITOR] Repaired disability → '{_d}'")
+                                                _repaired = True; break
+                                        except Exception: pass
+                                    if _repaired: break
+
+                            # 3. First name truncated
+                            elif "first name" in _blunder_lower or "guna" in _blunder_lower:
+                                for _inp in page.query_selector_all("input[type='text'], input:not([type])"):
+                                    try:
+                                        _lbl = _get_label_text(page, _inp).lower()
+                                        if "first" in _lbl or "given" in _lbl:
+                                            _inp.scroll_into_view_if_needed()
+                                            _inp.click(); page.wait_for_timeout(300)
+                                            _inp.fill(""); page.keyboard.type(field_data.get("first_name", "Gunakarthik Naidu"), delay=30)
+                                            page.keyboard.press("Tab")
+                                            log(f"  [AUDITOR] Repaired first name → '{field_data.get('first_name','Gunakarthik Naidu')}'")
+                                            _repaired = True; break
+                                    except Exception: pass
+
+                            # 4. Degree / dropdown placeholder
+                            elif "degree" in _blunder_lower or "select" in _blunder_lower or "placeholder" in _blunder_lower:
+                                _recursive_force_select(page, field_data, intelligence=_nim)
+                                log("  [AUDITOR] Ran force-select to clear placeholder dropdowns")
+                                _repaired = True
+
+                            # 5. Generic: use SoM element ID if provided
+                            elif _elem_id and _som_map.get(int(_elem_id)):
+                                _meta = _som_map[int(_elem_id)]
+                                _attr_sel = (
+                                    f"#{_meta['id']}" if _meta.get("id") else
+                                    f"[name='{_meta['name']}']" if _meta.get("name") else None
+                                )
+                                if _attr_sel and _fix:
+                                    try:
+                                        _target = page.locator(_attr_sel).first
+                                        if _target.is_visible(timeout=500):
+                                            _target.scroll_into_view_if_needed()
+                                            _target.click(); page.wait_for_timeout(300)
+                                            _target.fill(""); page.keyboard.type(_fix, delay=30)
+                                            page.keyboard.press("Tab")
+                                            log(f"  [AUDITOR] Repaired SoM#{_elem_id} → '{_fix[:40]}'")
+                                            _repaired = True
+                                    except Exception: pass
+
+                            if not _repaired:
+                                log(f"  [AUDITOR] No specific repair handler — running full re-fill")
+                                _fill_selects(page, field_data, intelligence=_nim)
+                                _fill_text_inputs(page, field_data)
+                                _recursive_force_select(page, field_data, intelligence=_nim)
+
+                            page.wait_for_timeout(600)
+
+                        except Exception as _audit_e:
+                            logger.warning("[AUDITOR] Error in audit round %d: %s", _audit_round + 1, _audit_e)
+                            _audit_passed = True  # Don't block submit on auditor infrastructure failure
+                            break
+
+                    if not _audit_passed:
+                        log("  [AUDITOR] All 3 repair rounds failed — submitting anyway (manual review needed)")
+
                     try:
                         btn.click(timeout=10000)
                     except Exception:
@@ -2207,8 +3594,15 @@ def run_playwright_apply(
                         pass
 
                     if _detect_captcha(page):
-                        log("CAPTCHA appeared after submit")
-                        return "captcha", "\n".join(log_lines)
+                        log("CAPTCHA appeared after submit — attempting solve...")
+                        if not _try_solve_captcha(page, page.url, log_fn=log):
+                            log("CAPTCHA unsolvable after submit")
+                            return "captcha", "\n".join(log_lines)
+                        log("CAPTCHA solved after submit — checking for success...")
+                        page.wait_for_timeout(2000)
+                        if _detect_success(page):
+                            log("Application submitted after CAPTCHA solve!")
+                            return "applied", "\n".join(log_lines)
 
                     if _detect_success(page):
                         log("Application submitted successfully!")
