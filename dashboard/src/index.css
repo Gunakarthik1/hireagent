@@ -4,16 +4,19 @@
 
 * { box-sizing: border-box; }
 html, body, #root { height: 100%; margin: 0; }
+
 body {
-  font-family: 'Inter', system-ui, sans-serif;
-  background: #fbf8ff;
-  color: #1b1b21;
+  font-family: 'Plus Jakarta Sans', system-ui, sans-serif;
+  background: #FAF9F6;
+  color: #18181B;
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
 }
+
 button { font-family: inherit; cursor: pointer; }
 input, select, textarea { font-family: inherit; }
 
+/* Material Symbols */
 .material-symbols-outlined {
   font-variation-settings: 'FILL' 0, 'wght' 400, 'GRAD' 0, 'opsz' 24;
   user-select: none;
@@ -23,48 +26,87 @@ input, select, textarea { font-family: inherit; }
   flex-shrink: 0;
 }
 
-/* Spinner */
-.ha-spinner {
-  width: 24px; height: 24px;
-  border: 2.5px solid rgba(20, 33, 117, 0.12);
-  border-top-color: #142175;
-  border-radius: 50%;
-  animation: spin 700ms linear infinite;
+/* Stagger fade-up for child elements */
+.stagger > * {
+  opacity: 0;
+  animation: fadeUp 0.5s ease forwards;
 }
+.stagger > *:nth-child(1) { animation-delay: 0.05s; }
+.stagger > *:nth-child(2) { animation-delay: 0.12s; }
+.stagger > *:nth-child(3) { animation-delay: 0.19s; }
+.stagger > *:nth-child(4) { animation-delay: 0.26s; }
+.stagger > *:nth-child(5) { animation-delay: 0.33s; }
+.stagger > *:nth-child(6) { animation-delay: 0.40s; }
+.stagger > *:nth-child(n+7) { animation-delay: 0.46s; }
+
+@keyframes fadeUp {
+  from { opacity: 0; transform: translateY(14px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
 @keyframes spin { to { transform: rotate(360deg); } }
 
 /* Scrollbars */
-::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar { width: 5px; height: 5px; }
 ::-webkit-scrollbar-track { background: transparent; }
-::-webkit-scrollbar-thumb { background: #c6c5d3; border-radius: 3px; }
-::-webkit-scrollbar-thumb:hover { background: #767682; }
+::-webkit-scrollbar-thumb { background: #D4D4D8; border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: #A1A1AA; }
 
-/* Toast stack */
+/* Log entry cobalt dot */
+.log-dot::before {
+  content: '';
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #2563EB;
+  margin-right: 10px;
+  flex-shrink: 0;
+  margin-top: 5px;
+}
+
+/* Toast */
 .ha-toast-stack {
-  position: fixed; bottom: 20px; right: 20px;
+  position: fixed; bottom: 24px; right: 24px;
   display: flex; flex-direction: column; gap: 8px; z-index: 9999;
 }
 .ha-toast {
   display: flex; align-items: center; gap: 8px;
-  background: white; border: 1px solid #e2e8f0;
-  border-radius: 10px; padding: 10px 14px;
-  box-shadow: 0 8px 24px -8px rgba(0,0,0,0.15);
+  background: #18181B; color: #FAF9F6;
+  border-radius: 10px; padding: 10px 16px;
+  box-shadow: 0 8px 24px -8px rgba(0,0,0,0.4);
   font-size: 13px; max-width: 360px;
   animation: toastIn 220ms cubic-bezier(.2,.7,.2,1);
 }
 @keyframes toastIn { from { opacity: 0; transform: translateX(20px); } to { opacity: 1; transform: translateX(0); } }
-.ha-toast--ok  { border-left: 3px solid #10b981; }
-.ha-toast--info { border-left: 3px solid #142175; }
+.ha-toast--ok  { border-left: 3px solid #22c55e; }
+.ha-toast--info { border-left: 3px solid #2563EB; }
 .ha-toast--err { border-left: 3px solid #ef4444; }
 
-/* Modal overlay */
+/* Modal */
 .ha-modal-overlay {
   position: fixed; inset: 0;
-  background: rgba(0,0,0,0.4);
+  background: rgba(0,0,0,0.5);
   backdrop-filter: blur(6px);
   display: grid; place-items: center;
   z-index: 1000; padding: 24px;
-  animation: fadeIn 160ms ease;
+  animation: overlayIn 160ms ease;
 }
-@keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
-@keyframes slideUp { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+@keyframes overlayIn { from { opacity: 0; } to { opacity: 1; } }
+@keyframes slideUp { from { opacity: 0; transform: translateY(12px); } to { opacity: 1; transform: translateY(0); } }
+
+/* Pipeline arrow connector */
+.pipeline-arrow::after {
+  content: '';
+  position: absolute;
+  right: -14px;
+  top: 50%;
+  transform: translateY(-50%);
+  border-left: 8px solid #E4E4E7;
+  border-top: 8px solid transparent;
+  border-bottom: 8px solid transparent;
+  z-index: 1;
+}
+.pipeline-arrow.active::after {
+  border-left-color: #DBEAFE;
+}

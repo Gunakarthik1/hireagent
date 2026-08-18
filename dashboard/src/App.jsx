@@ -37,7 +37,6 @@ export default function App() {
   const [scanning, setScanning] = useState(false)
   const [tailorOpen, setTailorOpen] = useState(false)
 
-  // Data
   const [jobs, setJobs] = useState([])
   const [versions, setVersions] = useState([])
   const [companies, setCompanies] = useState([])
@@ -45,7 +44,6 @@ export default function App() {
   const [profile, setProfile] = useState(DEFAULT_PROFILE)
   const [loading, setLoading] = useState(true)
 
-  // Fetch
   const fetchJobs = useCallback(async () => {
     try {
       const data = await api.getJobs({ limit: 500 })
@@ -75,7 +73,6 @@ export default function App() {
     return () => clearInterval(id)
   }, [fetchJobs, fetchVersions, fetchStats])
 
-  // Actions
   const handleRunScan = useCallback(async () => {
     setScanning(true)
     try {
@@ -123,15 +120,15 @@ export default function App() {
 
   if (loading) {
     return (
-      <div className="flex items-center justify-center h-screen bg-surface flex-col gap-3 text-on-surface-variant">
-        <div className="w-8 h-8 rounded-full border-2 border-primary/20 border-t-primary animate-spin" />
-        <span className="text-sm font-medium">Loading pipeline…</span>
+      <div className="flex items-center justify-center h-screen bg-paper flex-col gap-4">
+        <div className="w-6 h-6 rounded-full border-2 border-cobalt/20 border-t-cobalt animate-spin" />
+        <span className="text-sm text-stone font-medium">Starting up…</span>
       </div>
     )
   }
 
   return (
-    <div className="flex h-screen bg-background overflow-hidden">
+    <div className="flex h-screen bg-paper overflow-hidden">
       <Sidebar
         active={page}
         setActive={setPage}
@@ -139,12 +136,7 @@ export default function App() {
         scanning={scanning}
       />
 
-      {/* Main area */}
-      <div className="flex-1 ml-64 flex flex-col overflow-hidden">
-        {/* Top header */}
-        <TopBar onNewApplication={() => setTailorOpen(true)} />
-
-        {/* Page content */}
+      <div className="flex-1 ml-60 flex flex-col overflow-hidden">
         <div className="flex-1 overflow-y-auto">
           {page === 'dashboard' && (
             <DashboardPage
@@ -152,6 +144,8 @@ export default function App() {
               jobs={jobs}
               versions={versions}
               onGoToJobs={() => setPage('jobs')}
+              onRunScan={handleRunScan}
+              scanning={scanning}
             />
           )}
           {page === 'jobs' && (
@@ -173,13 +167,12 @@ export default function App() {
             />
           )}
           {page === 'profile' && (
-            <div className="p-8 max-w-3xl mx-auto">
-              <div className="mb-8">
-                <p className="text-xs font-semibold text-on-surface-variant uppercase tracking-widest mb-1">Profile</p>
-                <h1 className="text-3xl font-bold text-on-surface tracking-tight">Setup your profile</h1>
-                <p className="text-on-surface-variant mt-1">Configure how the agent targets jobs and tailors your resume.</p>
+            <div className="p-10 max-w-3xl mx-auto">
+              <div className="mb-10">
+                <h1 className="font-serif text-4xl text-ink mb-2">Your profile</h1>
+                <p className="text-stone">Tell the agent who you are. It uses this to find and tailor roles for you.</p>
               </div>
-              <div className="bg-white border border-outline-variant rounded-2xl p-8 shadow-sm">
+              <div className="bg-white border border-zinc-200 rounded-2xl p-8 shadow-sm">
                 <ProfileWizard
                   profile={profile}
                   onComplete={handleWizardComplete}
@@ -202,44 +195,5 @@ export default function App() {
         onCreated={handleTailored}
       />
     </div>
-  )
-}
-
-function TopBar({ onNewApplication }) {
-  return (
-    <header className="sticky top-0 z-40 w-full border-b border-slate-200 bg-white/80 backdrop-blur-md flex justify-between items-center h-16 px-8 shadow-sm flex-shrink-0">
-      <div className="flex items-center gap-6">
-        <span className="hidden md:block text-lg font-black text-primary">HireAgent</span>
-        <div className="relative">
-          <Icon name="search" size={18} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
-          <input
-            className="pl-10 pr-4 py-1.5 bg-slate-50 border border-slate-200 rounded-lg text-sm w-64 focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary/40 transition-all"
-            placeholder="Search jobs, companies…"
-            type="text"
-          />
-        </div>
-        <nav className="hidden lg:flex items-center gap-5">
-          <span className="text-slate-400 text-sm font-medium">Analytics</span>
-          <span className="text-slate-400 text-sm font-medium">Inbox</span>
-        </nav>
-      </div>
-      <div className="flex items-center gap-3">
-        <button className="p-2 text-slate-500 hover:bg-slate-50 rounded-md transition-all">
-          <Icon name="notifications" size={20} />
-        </button>
-        <button className="p-2 text-slate-500 hover:bg-slate-50 rounded-md transition-all">
-          <Icon name="history" size={20} />
-        </button>
-        <button
-          onClick={onNewApplication}
-          className="px-4 py-2 bg-primary text-white font-semibold text-sm rounded-lg hover:bg-primary-dark transition-all active:scale-95 shadow-sm"
-        >
-          New Application
-        </button>
-        <div className="w-8 h-8 rounded-full bg-indigo-100 flex items-center justify-center text-primary font-bold text-sm">
-          G
-        </div>
-      </div>
-    </header>
   )
 }

@@ -1,89 +1,89 @@
 import { useState, useEffect, useCallback, createContext, useContext } from 'react'
 import Icon from './Icon.jsx'
 
-// ── Match Score Badge ─────────────────────────────────────────────────
+// ── Match Score Badge (used across components) ────────────────────────────────
 export function MatchBadge({ score }) {
-  const pct = Math.round(score * 10)
-  const cls = pct >= 90
-    ? 'bg-emerald-50 text-emerald-700 border border-emerald-200'
-    : pct >= 80
-    ? 'bg-indigo-50 text-indigo-700 border border-indigo-200'
-    : pct >= 70
-    ? 'bg-amber-50 text-amber-700 border border-amber-200'
-    : 'bg-slate-100 text-slate-600 border border-slate-200'
+  const s = Number(score) || 0
+  if (s >= 8) return (
+    <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-bold bg-emerald-50 text-emerald-700 border border-emerald-200">
+      {s.toFixed(1)}
+    </span>
+  )
+  if (s >= 6) return (
+    <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-bold bg-amber-50 text-amber-700 border border-amber-200">
+      {s.toFixed(1)}
+    </span>
+  )
   return (
-    <span className={`inline-flex items-center gap-1 px-2 py-1 rounded-full text-xs font-bold ${cls}`}>
-      {pct >= 85 && <Icon name="verified" size={13} filled />}
-      {pct}% Match
+    <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-bold bg-zinc-100 text-stone border border-zinc-200">
+      {s.toFixed(1)}
     </span>
   )
 }
 
-// ── Match Score Box (larger, for job cards) ───────────────────────────
+// ── Match Score Box ───────────────────────────────────────────────────────────
 export function MatchBox({ score }) {
-  const pct = Math.round(score * 10)
-  const { bg, text } = pct >= 90
-    ? { bg: 'bg-primary-fixed', text: 'text-primary' }
-    : pct >= 80
-    ? { bg: 'bg-secondary-fixed', text: 'text-on-secondary-fixed-variant' }
-    : { bg: 'bg-surface-container-high', text: 'text-on-surface-variant' }
+  const s = Number(score) || 0
+  const { bg, text } = s >= 8
+    ? { bg: 'bg-emerald-50 border-emerald-200', text: 'text-emerald-700' }
+    : s >= 6
+    ? { bg: 'bg-amber-50 border-amber-200',   text: 'text-amber-700' }
+    : { bg: 'bg-zinc-100 border-zinc-200',    text: 'text-stone' }
   return (
-    <div className={`inline-flex flex-col items-center p-3 ${bg} rounded-xl min-w-[60px]`}>
-      <span className={`${text} font-black text-2xl leading-none`}>{pct}%</span>
-      <span className={`${text} text-[9px] font-bold uppercase tracking-tighter opacity-70 mt-0.5`}>Match</span>
+    <div className={`inline-flex flex-col items-center p-3 ${bg} border rounded-xl min-w-[60px]`}>
+      <span className={`${text} font-bold text-xl leading-none tabular-nums`}>{s.toFixed(1)}</span>
+      <span className={`${text} text-[9px] font-semibold uppercase tracking-tight opacity-60 mt-1`}>Score</span>
     </div>
   )
 }
 
-// ── Status Badge ──────────────────────────────────────────────────────
+// ── Status Badge ──────────────────────────────────────────────────────────────
 export function StatusBadge({ status, hasTailored }) {
   const s = status || 'pending'
   if (s === 'interview') return (
-    <span className="px-2 py-0.5 bg-green-100 text-green-700 rounded-md text-[10px] font-bold uppercase tracking-wider">Interviewing</span>
+    <span className="px-2.5 py-0.5 bg-emerald-50 text-emerald-700 rounded-full text-[11px] font-semibold border border-emerald-200">Interviewing</span>
   )
   if (s === 'applied') return (
-    <span className="px-2 py-0.5 bg-blue-100 text-blue-700 rounded-md text-[10px] font-bold uppercase tracking-wider">Applied</span>
+    <span className="px-2.5 py-0.5 bg-cobalt text-white rounded-full text-[11px] font-semibold">Applied</span>
   )
   if (s === 'rejected') return (
-    <span className="px-2 py-0.5 bg-red-100 text-red-700 rounded-md text-[10px] font-bold uppercase tracking-wider">Rejected</span>
+    <span className="px-2.5 py-0.5 bg-zinc-100 text-stone rounded-full text-[11px] font-semibold">Passed</span>
   )
   if (hasTailored) return (
-    <span className="px-2 py-0.5 bg-emerald-50 text-emerald-700 border border-emerald-200 rounded-md text-[10px] font-bold uppercase tracking-wider">Tailored</span>
+    <span className="px-2.5 py-0.5 bg-emerald-50 text-emerald-700 rounded-full text-[11px] font-semibold border border-emerald-200">Tailored</span>
   )
   return (
-    <span className="px-2 py-0.5 bg-blue-100 text-blue-700 border border-blue-200 rounded-md text-[10px] font-bold uppercase tracking-wider">Analyzing</span>
+    <span className="px-2.5 py-0.5 bg-cobalt-mid text-cobalt rounded-full text-[11px] font-semibold">New</span>
   )
 }
 
-// ── Company Avatar ────────────────────────────────────────────────────
+// ── Company Avatar ────────────────────────────────────────────────────────────
 export function CompanyAvatar({ company, size = 40 }) {
-  const colors = [
-    'bg-indigo-100 text-indigo-700',
+  const palettes = [
+    'bg-violet-100 text-violet-700',
+    'bg-sky-100 text-sky-700',
     'bg-emerald-100 text-emerald-700',
     'bg-amber-100 text-amber-700',
     'bg-rose-100 text-rose-700',
-    'bg-sky-100 text-sky-700',
-    'bg-violet-100 text-violet-700',
+    'bg-cobalt-mid text-cobalt',
   ]
-  const idx = (company || '?').charCodeAt(0) % colors.length
-  const colorCls = colors[idx]
-  const letter = (company || '?')[0].toUpperCase()
+  const idx = (company || '?').charCodeAt(0) % palettes.length
   return (
     <div
-      className={`flex items-center justify-center rounded-lg font-bold flex-shrink-0 ${colorCls}`}
-      style={{ width: size, height: size, fontSize: size * 0.4 }}
+      className={`flex items-center justify-center rounded-xl font-bold flex-shrink-0 ${palettes[idx]}`}
+      style={{ width: size, height: size, fontSize: size * 0.38 }}
     >
-      {letter}
+      {(company || '?')[0].toUpperCase()}
     </div>
   )
 }
 
-// ── StatusPip (kept for backward compat) ─────────────────────────────
+// ── StatusPip (compat alias) ──────────────────────────────────────────────────
 export function StatusPip({ status }) {
   return <StatusBadge status={status} />
 }
 
-// ── Resume Modal ──────────────────────────────────────────────────────
+// ── Resume Modal ──────────────────────────────────────────────────────────────
 export function ResumeModal({ open, onClose, pdfUrl, title }) {
   useEffect(() => {
     if (!open) return
@@ -99,17 +99,17 @@ export function ResumeModal({ open, onClose, pdfUrl, title }) {
         style={{ width: 'min(90vw, 960px)', maxHeight: '90vh', animation: 'slideUp 200ms cubic-bezier(.2,.7,.2,1)' }}
         onClick={e => e.stopPropagation()}
       >
-        <div className="flex justify-between items-center px-6 py-4 border-b border-slate-100 bg-slate-50 flex-shrink-0">
-          <span className="font-semibold text-sm text-slate-800">{title || 'Tailored Resume'}</span>
+        <div className="flex justify-between items-center px-6 py-4 border-b border-zinc-100 bg-paper flex-shrink-0">
+          <span className="font-semibold text-sm text-ink">{title || 'Tailored Resume'}</span>
           <div className="flex gap-2">
             <a
-              className="flex items-center gap-1.5 px-3 py-1.5 border border-slate-200 rounded-lg text-sm text-slate-600 hover:bg-white transition-colors"
+              className="flex items-center gap-1.5 px-3 py-1.5 border border-zinc-200 rounded-lg text-sm text-ink hover:bg-paper transition-colors"
               href={pdfUrl} download target="_blank" rel="noopener"
             >
               <Icon name="download" size={15} /> Download
             </a>
             <button
-              className="p-1.5 text-slate-400 hover:text-slate-600 hover:bg-slate-100 rounded-lg transition-colors"
+              className="p-1.5 text-stone hover:text-ink hover:bg-zinc-50 rounded-lg transition-colors"
               onClick={onClose}
             >
               <Icon name="close" size={18} />
@@ -122,7 +122,7 @@ export function ResumeModal({ open, onClose, pdfUrl, title }) {
   )
 }
 
-// ── Modal wrapper ─────────────────────────────────────────────────────
+// ── Modal wrapper ─────────────────────────────────────────────────────────────
 export function Modal({ open, onClose, children, width = 720 }) {
   useEffect(() => {
     if (!open) return
@@ -144,7 +144,7 @@ export function Modal({ open, onClose, children, width = 720 }) {
   )
 }
 
-// ── Tooltip ───────────────────────────────────────────────────────────
+// ── Tooltip ───────────────────────────────────────────────────────────────────
 export function Tooltip({ children, content, side = 'top' }) {
   const [open, setOpen] = useState(false)
   const posClass = side === 'left'
@@ -154,7 +154,7 @@ export function Tooltip({ children, content, side = 'top' }) {
     <span className="relative inline-block" onMouseEnter={() => setOpen(true)} onMouseLeave={() => setOpen(false)}>
       {children}
       {open && (
-        <span className={`absolute z-50 ${posClass} bg-slate-900 text-white text-xs rounded-lg px-3 py-2 shadow-xl whitespace-nowrap pointer-events-none`}>
+        <span className={`absolute z-50 ${posClass} bg-ink text-paper text-xs rounded-lg px-3 py-2 shadow-xl whitespace-nowrap pointer-events-none`}>
           {content}
         </span>
       )}
@@ -162,24 +162,24 @@ export function Tooltip({ children, content, side = 'top' }) {
   )
 }
 
-// ── ScoreBreakdown ────────────────────────────────────────────────────
+// ── Score Breakdown ───────────────────────────────────────────────────────────
 export function ScoreBreakdown({ kw, sk, ex, ed }) {
   const rows = [
-    { label: 'Keywords',   weight: '40%', value: kw },
-    { label: 'Skills',     weight: '30%', value: sk },
-    { label: 'Experience', weight: '20%', value: ex },
-    { label: 'Education',  weight: '10%', value: ed },
+    { label: 'Keywords',   value: kw },
+    { label: 'Skills',     value: sk },
+    { label: 'Experience', value: ex },
+    { label: 'Education',  value: ed },
   ]
   return (
     <div className="flex flex-col gap-2 min-w-[200px]">
       {rows.map(r => (
         <div key={r.label} className="space-y-1">
-          <div className="flex justify-between text-xs text-slate-500">
+          <div className="flex justify-between text-xs text-stone">
             <span>{r.label}</span>
-            <span className="font-medium text-slate-700">{r.value || 0}%</span>
+            <span className="font-medium text-ink">{r.value || 0}%</span>
           </div>
-          <div className="h-1.5 bg-slate-100 rounded-full overflow-hidden">
-            <div className="h-full bg-primary rounded-full" style={{ width: `${r.value || 0}%` }} />
+          <div className="h-1.5 bg-zinc-100 rounded-full overflow-hidden">
+            <div className="h-full bg-cobalt rounded-full" style={{ width: `${r.value || 0}%` }} />
           </div>
         </div>
       ))}
@@ -187,16 +187,16 @@ export function ScoreBreakdown({ kw, sk, ex, ed }) {
   )
 }
 
-// ── VersionBadge (kept for backward compat) ───────────────────────────
+// ── Version Badge ─────────────────────────────────────────────────────────────
 export function VersionBadge({ id, tone, count, onClick }) {
   if (!id) return null
   const colors = {
     violet: 'bg-violet-100 text-violet-700 border-violet-200',
     emerald: 'bg-emerald-100 text-emerald-700 border-emerald-200',
-    sky: 'bg-sky-100 text-sky-700 border-sky-200',
-    amber: 'bg-amber-100 text-amber-700 border-amber-200',
-    rose: 'bg-rose-100 text-rose-700 border-rose-200',
-    teal: 'bg-teal-100 text-teal-700 border-teal-200',
+    sky:    'bg-sky-100 text-sky-700 border-sky-200',
+    amber:  'bg-amber-100 text-amber-700 border-amber-200',
+    rose:   'bg-rose-100 text-rose-700 border-rose-200',
+    teal:   'bg-teal-100 text-teal-700 border-teal-200',
   }
   const colorCls = colors[tone] || colors.violet
   return (
@@ -205,15 +205,15 @@ export function VersionBadge({ id, tone, count, onClick }) {
       onClick={onClick}
       className={`inline-flex items-center gap-1.5 px-2 py-1 rounded-md border text-xs font-semibold font-mono ${colorCls} ${onClick ? 'cursor-pointer hover:opacity-80' : 'cursor-default'}`}
     >
-      <span className="w-4 h-4 rounded flex items-center justify-center bg-current/20 text-[10px] font-bold"
-        style={{ background: 'currentColor', color: 'white', opacity: 1 }}
-      >{id}</span>
+      <span className="w-4 h-4 rounded flex items-center justify-center text-[10px] font-bold bg-current/20">
+        {id}
+      </span>
       {count != null && <span className="opacity-70">· {count}</span>}
     </button>
   )
 }
 
-// ── Toast ─────────────────────────────────────────────────────────────
+// ── Toast ─────────────────────────────────────────────────────────────────────
 const ToastCtx = createContext(null)
 
 export function ToastProvider({ children }) {
