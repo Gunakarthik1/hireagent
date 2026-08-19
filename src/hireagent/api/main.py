@@ -54,7 +54,7 @@ app = FastAPI(title="HireAgent API", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:4173", "http://localhost:3000"],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -492,9 +492,10 @@ _DIST = Path(__file__).parent.parent.parent.parent / "dashboard" / "dist"
 if _DIST.exists():
     app.mount("/assets", StaticFiles(directory=str(_DIST / "assets")), name="assets")
 
-    @app.get("/{full_path:path}", include_in_schema=False)
-    def serve_spa(full_path: str):
-        index = _DIST / "index.html"
-        if index.exists():
-            return FileResponse(str(index))
-        return JSONResponse({"detail": "Dashboard not built yet. Run: cd dashboard && npm run build"})
+@app.get("/", include_in_schema=False)
+@app.get("/{full_path:path}", include_in_schema=False)
+async def serve_frontend(full_path: str = ""):
+    index = _DIST / "index.html"
+    if index.exists():
+        return FileResponse(str(index))
+    return {"error": "Frontend not built. Run: cd dashboard && npm run build"}

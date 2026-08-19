@@ -1,3 +1,5 @@
+@import url('https://fonts.googleapis.com/css2?family=Nunito:wght@300;400;500;600;700;800;900&display=swap');
+
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
@@ -6,7 +8,7 @@
 html, body, #root { height: 100%; margin: 0; }
 
 body {
-  font-family: 'Plus Jakarta Sans', system-ui, sans-serif;
+  font-family: 'Nunito', sans-serif;
   background: #FAF9F6;
   color: #18181B;
   -webkit-font-smoothing: antialiased;
@@ -109,4 +111,29 @@ input, select, textarea { font-family: inherit; }
 }
 .pipeline-arrow.active::after {
   border-left-color: #DBEAFE;
+}
+
+/* Cards / panels */
+.card, [class*="rounded-2xl"], [class*="rounded-xl"] {
+  border-radius: 1.5rem;
+}
+
+/* Buttons */
+button {
+  border-radius: 50rem;
+  transition: all 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+}
+button:hover {
+  transform: translateY(-2px);
+}
+
+/* Scroll reveal */
+.reveal {
+  opacity: 0;
+  transform: translateY(24px);
+  transition: opacity 0.65s cubic-bezier(0.16, 1, 0.3, 1), transform 0.65s cubic-bezier(0.16, 1, 0.3, 1);
+}
+.reveal.visible {
+  opacity: 1;
+  transform: translateY(0);
 }

@@ -30,8 +30,8 @@ export default {
         outline: '#A1A1AA',
       },
       fontFamily: {
+        sans: ['Nunito', 'sans-serif'],
         serif: ['"Instrument Serif"', 'Georgia', 'serif'],
-        sans: ['"Plus Jakarta Sans"', 'system-ui', 'sans-serif'],
         mono: ['"JetBrains Mono"', '"Fira Code"', 'monospace'],
       },
       keyframes: {
